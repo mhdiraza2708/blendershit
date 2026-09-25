@@ -39,6 +39,7 @@ Options (put them after "--" when using the blender binary):
 
 import argparse
 import math
+import os
 import random
 import sys
 import time
@@ -63,6 +64,7 @@ PRESETS = {
     "draft":   dict(res=(960, 540), samples=32, density=0.45, detail=1),
     "preview": dict(res=(1280, 720), samples=48, density=1.0, detail=1),
     "final":   dict(res=(2560, 1440), samples=48, density=1.0, detail=2),      # 1440p
+    "video":   dict(res=(960, 540), samples=12, density=1.0, detail=1),       # per-frame budget
 }
 
 LOOK = dict(
@@ -1565,15 +1567,20 @@ def scatter_object(name, P, rot, scl, var, coll, asset_coll, viewport_fraction=1
 class View:
     """Camera frustum in numpy form, used to only scatter what can be seen."""
 
-    def __init__(self, cam_ob, res):
-        R = np.array(cam_ob.rotation_euler.to_matrix())
-        self.pos = np.array(cam_ob.location)
+    def __init__(self, pos, rot, tan_h, aspect):
+        R = np.array(rot)
+        self.pos = np.array(pos, dtype=np.float64)
         self.fwd = R @ np.array([0.0, 0.0, -1.0])
         self.right = R @ np.array([1.0, 0.0, 0.0])
         self.up = R @ np.array([0.0, 1.0, 0.0])
-        self.tan_h = (cam_ob.data.sensor_width / 2.0) / cam_ob.data.lens
-        self.tan_v = self.tan_h * res[1] / res[0]
+        self.tan_h = tan_h
+        self.tan_v = tan_h * aspect
         self.heading = math.atan2(self.fwd[0], self.fwd[1])
+
+    @classmethod
+    def from_camera(cls, cam_ob, res):
+        tan_h = (cam_ob.data.sensor_width / 2.0) / cam_ob.data.lens
+        return cls(cam_ob.location, cam_ob.rotation_euler.to_matrix(), tan_h, res[1] / res[0])
 
     def visible(self, P, margin=0.12, pad=0.5):
         d = P - self.pos
@@ -1592,6 +1599,52 @@ class View:
     def wedge_area(self, r0, r1, extra_angle=0.2):
         half = math.atan(self.tan_h) + extra_angle
         return half * (r1 * r1 - r0 * r0)
+
+    def off_axis(self, x, y):
+        """Horizontal angle between the view axis and the direction to (x, y)."""
+        return np.abs(np.angle(np.exp(1j * (np.arctan2(x - self.pos[0], y - self.pos[1]) - self.heading))))
+
+    def in_wedge(self, x, y, r0, r1, extra_angle=0.2):
+        r = np.hypot(x - self.pos[0], y - self.pos[1])
+        return (r >= r0) & (r <= r1) & (self.off_axis(x, y) <= math.atan(self.tan_h) + extra_angle)
+
+
+class ViewSet:
+    """The union of the camera's views: one for a still, several poses sampled along
+    the camera move for an animation. Scattering covers everything any pose sees."""
+
+    def __init__(self, views):
+        self.views = views
+        self.first = views[0]
+
+    def sample(self, rng, density, r0, r1, extra_angle=0.2, count=None):
+        """Uniform candidate points over the union of the views' ground wedges.
+        Returns x, y and r = distance to the nearest camera position."""
+        xs, ys = [], []
+        area0 = self.first.wedge_area(r0, r1, extra_angle)
+        for i, v in enumerate(self.views):
+            if count is not None:
+                n = int(count * v.wedge_area(r0, r1, extra_angle) / area0) if i else count
+            else:
+                # candidate count uses the default wedge angle, as the original still did,
+                # so the still's layout stays exactly reproducible
+                n = int(v.wedge_area(r0, r1) * density)
+            x, y, r = v.wedge(rng, n, r0, r1, extra_angle)
+            if len(self.views) == 1:
+                return x, y, r
+            keep = np.ones(len(x), dtype=bool)
+            for u in self.views[:i]:                       # each region sampled once
+                keep &= ~u.in_wedge(x, y, r0, r1, extra_angle)
+            xs.append(x[keep])
+            ys.append(y[keep])
+        x, y = np.concatenate(xs), np.concatenate(ys)
+        return x, y, self.distance(x, y)
+
+    def distance(self, x, y):
+        return np.min([np.hypot(x - v.pos[0], y - v.pos[1]) for v in self.views], axis=0)
+
+    def in_cone(self, x, y, extra_angle):
+        return np.any([v.in_wedge(x, y, 0.0, 1e9, extra_angle) for v in self.views], axis=0)
 
 
 def poisson_disk(rng, x0, x1, y0, y1, r, k=24):
@@ -1716,7 +1769,49 @@ def add_fog(coll, bounds, density, anisotropy):
     return ob
 
 
-def setup_camera(coll, terrain):
+def camera_track(terrain, path, frames, fps, speed, seed):
+    """Camera poses for a steady, gimbal-like walk along the footpath: eye height above
+    the (smoothed) ground, looking ~9 m ahead along the path, with a faint handheld drift.
+    Returns a list of (location Vector, rotation Euler), one per frame."""
+    pts = path.pts
+    cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+    s0 = cum[int(np.argmin(np.hypot(pts[:, 0] - LOOK["cam_xy"][0], pts[:, 1] - LOOK["cam_xy"][1])))]
+    t = np.arange(frames) / fps
+    s = s0 + speed * t
+
+    def at(sv):
+        return np.interp(sv, cum, pts[:, 0]), np.interp(sv, cum, pts[:, 1])
+
+    def ground(sv):                        # average over +-0.8 m so the camera doesn't bob
+        off = np.linspace(-0.8, 0.8, 5)
+        gx, gy = at(sv[:, None] + off[None, :])
+        return terrain.height(gx.ravel(), gy.ravel()).reshape(gx.shape).mean(axis=1)
+
+    ahead = 9.0
+    x, y = at(s)
+    z = ground(s) + LOOK["cam_height"]
+    tx, ty = at(s + ahead)
+    tz = ground(s + ahead) + LOOK["cam_height"] + ahead * math.tan(math.radians(LOOK["cam_tilt"]))
+    rng = np.random.default_rng(seed + 77)
+    ph = rng.uniform(0, 2 * np.pi, 6)
+
+    def drift(i, amp, f):
+        return amp * (np.sin(2 * np.pi * f * t + ph[i]) + 0.5 * np.sin(2 * np.pi * f * 2.3 * t + ph[i + 3]))
+    x = x + drift(0, 0.012, 0.21)
+    z = z + drift(1, 0.008, 0.33)
+    tz = tz + drift(2, 0.03, 0.17)
+    poses, prev = [], None
+    for i in range(frames):
+        loc = Vector((x[i], y[i], z[i]))
+        rot = (Vector((tx[i], ty[i], tz[i])) - loc).to_track_quat("-Z", "Y").to_euler()
+        if prev is not None:
+            rot.make_compatible(prev)
+        prev = rot
+        poses.append((loc, rot))
+    return poses
+
+
+def setup_camera(coll, terrain, track=None):
     cam = bpy.data.cameras.new("Camera")
     cam.lens = LOOK["lens"]
     cam.sensor_width = 36.0
@@ -1728,6 +1823,13 @@ def setup_camera(coll, terrain):
     cam.dof.aperture_fstop = LOOK["fstop"]
     cam.dof.aperture_blades = 7
     ob = new_object("Camera", cam, coll)
+    if track:
+        for f, (loc, rot) in enumerate(track, start=1):
+            ob.location, ob.rotation_euler = loc, rot
+            ob.keyframe_insert("location", frame=f)
+            ob.keyframe_insert("rotation_euler", frame=f)
+        ob.location, ob.rotation_euler = track[0]
+        return ob
     x, y = LOOK["cam_xy"]
     ob.location = (x, y, float(terrain.height(np.array([x]), np.array([y]))[0]) + LOOK["cam_height"])
     ob.rotation_euler = (math.radians(90.0 + LOOK["cam_tilt"]), 0.0, math.radians(LOOK["cam_yaw"]))
@@ -1783,6 +1885,8 @@ def setup_render(scene, opts):
     c.transmission_bounces = 4
     c.volume_bounces = 0            # single scattering in the haze is enough for the shafts
     c.transparent_max_bounces = 8
+    if getattr(opts, "preset", "") == "video":      # hundreds of frames: trim the budget further
+        c.max_bounces, c.diffuse_bounces, c.transmission_bounces = 6, 2, 3
     c.sample_clamp_direct = 0.0
     c.sample_clamp_indirect = 6.0
     c.blur_glossy = 1.0
@@ -1926,9 +2030,23 @@ def build_forest(opts):
 
     path = FootPath(PATH_POINTS, PATH_HALF_WIDTH)
     terrain = Terrain(opts.seed, path)
-    cam = setup_camera(c_env, terrain)
+    animate = bool(getattr(opts, "animate", None))
+    track = None
+    if animate:
+        frames = max(2, int(round(opts.animate * opts.fps)))
+        track = camera_track(terrain, path, frames, opts.fps, opts.speed, opts.seed)
+        scene.frame_start, scene.frame_end = 1, frames
+        scene.render.fps = opts.fps
+        log(f"camera move: {frames} frames, {opts.speed * (frames - 1) / opts.fps:.1f} m along the path")
+    cam = setup_camera(c_env, terrain, track)
     scene.camera = cam
-    view = View(cam, opts.res)
+    view = View.from_camera(cam, opts.res)
+    tan_h = view.tan_h
+    if track:        # scatter must cover what the camera sees anywhere along its move
+        poses = track[::max(1, opts.fps // 2)] + [track[-1]]
+        views = ViewSet([View(loc, rot.to_matrix(), tan_h, opts.res[1] / opts.res[0]) for loc, rot in poses])
+    else:
+        views = ViewSet([view])
     to_sun = sun_vector(LOOK["sun_azimuth"], LOOK["sun_elevation"], view.heading)
     shade_dir = Vector((-to_sun.x, -to_sun.y, 0.0)).normalized()
     shade = tuple(shade_dir)
@@ -1973,13 +2091,10 @@ def build_forest(opts):
     # --- forest layout -------------------------------------------------------------
     # plant the whole view cone (plus margins for shadows) so the forest never visibly ends
     pts = poisson_disk(rng, cx - 270.0, cx + 270.0, cy - 30.0, cy + 380.0, 6.3)
-    rel = pts - np.array([cx, cy])
-    ang = np.abs(np.angle(np.exp(1j * (np.arctan2(rel[:, 0], rel[:, 1]) - view.heading))))
-    near = np.hypot(rel[:, 0], rel[:, 1]) < 70.0
-    pts = pts[near | (ang < math.atan(view.tan_h) + 0.45)]
+    pts = pts[(views.distance(pts[:, 0], pts[:, 1]) < 70.0) | views.in_cone(pts[:, 0], pts[:, 1], 0.45)]
     d_path = path.distance(pts[:, 0], pts[:, 1])
     keep = (d_path > 2.3) & (obstacles.clearance(pts[:, 0], pts[:, 1]) > 3.0)
-    keep &= np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) > 3.5
+    keep &= views.distance(pts[:, 0], pts[:, 1]) > 3.5
     # irregular canopy gaps let shafts of sunlight into the stand
     gaps = Perlin(opts.seed + 5).fbm(pts[:, 0] / 28.0, pts[:, 1] / 28.0, 2)
     keep &= gaps > -0.28
@@ -2004,13 +2119,16 @@ def build_forest(opts):
         me, info, _, nl_ = tree_mesh(f"sapling_{i:02d}", SPECIES["sapling"], opts.seed * 50 + i, max(detail, 1),
                                      M["beech"], M["leaf_sapling"], leaf_detail=2)
         new_object(f"sapling_{i:02d}", me, coll)
-    x, y, r = view.wedge(nrng, int(view.wedge_area(2.5, 90.0) * 0.08 * opts.density), 2.5, 90.0, 0.35)
+    x, y, r = views.sample(nrng, 0.08 * opts.density, 2.5, 90.0, 0.35)
     d = path.distance(x, y)
     patch = Perlin(opts.seed + 9).fbm(x / 18.0, y / 18.0, 3)
-    prob = smoothstep(-0.2, 0.3, patch) * smoothstep(1.3, 2.5, d) * smoothstep(0.3, 1.2, obstacles.clearance(x, y))
+    clear = (2.6, 4.0) if animate else (1.3, 2.5)      # a moving camera must not brush through leaves
+    prob = smoothstep(-0.2, 0.3, patch) * smoothstep(*clear, d) * smoothstep(0.3, 1.2, obstacles.clearance(x, y))
     # keep the middle of the frame open near the camera: close saplings only frame the edges
-    off_axis = np.abs(np.angle(np.exp(1j * (np.arctan2(x - view.pos[0], y - view.pos[1]) - view.heading))))
-    prob *= np.where(r < 14.0, smoothstep(0.42, 0.6, off_axis), 1.0) * smoothstep(4.0, 7.0, r)
+    for v in views.views:
+        near_v = np.hypot(x - v.pos[0], y - v.pos[1]) < 14.0
+        prob *= np.where(near_v, smoothstep(0.42, 0.6, v.off_axis(x, y)), 1.0)
+    prob *= smoothstep(4.0, 7.0, r)
     sel = nrng.random(len(x)) < prob
     x, y, d = x[sel], y[sel], d[sel]
     k = len(x)
@@ -2025,7 +2143,7 @@ def build_forest(opts):
     nf = 8
     for i in range(nf):
         new_object(f"fern_{i:02d}", build_fern(rng, detail, M["fern"]), coll)
-    x, y, r = view.wedge(nrng, int(view.wedge_area(0.8, 60.0) * 2.4 * opts.density), 0.8, 60.0, 0.3)
+    x, y, r = views.sample(nrng, 2.4 * opts.density, 0.8, 60.0, 0.3)
     d = path.distance(x, y)
     patch = Perlin(opts.seed + 21).fbm(x / 8.0, y / 8.0, 3)
     prob = (smoothstep(-0.05, 0.3, patch) * smoothstep(1.0, 1.7, d) * smoothstep(0.1, 0.6, obstacles.clearance(x, y))
@@ -2044,7 +2162,7 @@ def build_forest(opts):
     ng_ = 6
     for i in range(ng_):
         new_object(f"grass_{i:02d}", build_grass(rng, M["grass"], rng.randint(30, 70), rng.uniform(0.25, 0.55)), coll)
-    x, y, r = view.wedge(nrng, int(view.wedge_area(0.6, 40.0) * 3.0 * opts.density), 0.6, 40.0, 0.3)
+    x, y, r = views.sample(nrng, 3.0 * opts.density, 0.6, 40.0, 0.3)
     d = path.distance(x, y)
     patch = Perlin(opts.seed + 33).fbm(x / 5.0, y / 5.0, 3)
     band = np.exp(-((d - PATH_HALF_WIDTH * 1.5) / 0.55) ** 2)
@@ -2064,7 +2182,7 @@ def build_forest(opts):
     nlit = 10
     for i in range(nlit):
         new_object(f"litter_{i:02d}", build_litter_leaf(rng, M["litter"], "oak" if i >= 7 else "beech"), coll)
-    x, y, r = view.wedge(nrng, int(view.wedge_area(0.3, 24.0) * 380 * opts.density), 0.3, 24.0, 0.28)
+    x, y, r = views.sample(nrng, 380 * opts.density, 0.3, 24.0, 0.28)
     d = path.distance(x, y)
     prob = (1.0 - 0.62 * smoothstep(6.0, 12.0, r)) * (1.0 - smoothstep(14.0, 24.0, r)) * (1.0 - 0.6 * path.mask(d))
     sel = nrng.random(len(x)) < prob
@@ -2082,7 +2200,7 @@ def build_forest(opts):
     ntw = 8
     for i in range(ntw):
         new_object(f"twig_{i:02d}", build_twig(rng, M["deadwood"]), coll)
-    x, y, r = view.wedge(nrng, int(view.wedge_area(0.5, 25.0) * 0.6 * opts.density), 0.5, 25.0, 0.28)
+    x, y, r = views.sample(nrng, 0.6 * opts.density, 0.5, 25.0, 0.28)
     k = len(x)
     z = terrain.height(x, y) + 0.003
     n = terrain.normal(x, y)
@@ -2096,7 +2214,7 @@ def build_forest(opts):
     nrk = 6
     for i in range(nrk):
         new_object(f"rock_{i:02d}", build_rock(rng, M["rock"], 1.0), coll)
-    x, y, r = view.wedge(nrng, 400, 3.0, 45.0, 0.3)
+    x, y, r = views.sample(nrng, None, 3.0, 45.0, 0.3, count=400)
     d = path.distance(x, y)
     keep = (d > 1.0) & (obstacles.clearance(x, y) > 0.8)
     x, y, d = x[keep][:22], y[keep][:22], d[keep][:22]
@@ -2201,6 +2319,9 @@ def parse_args(argv=None):
     p.add_argument("--save", type=str, default=None)
     p.add_argument("--threads", type=int, default=0)
     p.add_argument("--gpu", action="store_true")
+    p.add_argument("--animate", type=float, default=None, metavar="SECONDS")
+    p.add_argument("--fps", type=int, default=24)
+    p.add_argument("--speed", type=float, default=1.4, metavar="M_PER_S")
     a = p.parse_args(argv)
     pr = PRESETS[a.preset]
     a.res = tuple(int(v) for v in a.res.lower().split("x")) if a.res else pr["res"]
@@ -2210,6 +2331,71 @@ def parse_args(argv=None):
     return a
 
 
+def render_animation(scene, out, opts):
+    """Render the camera move to numbered PNGs next to `out` (re-running resumes where it
+    stopped), then encode them to `out` when it is a video file (.mp4/.mkv/.mov)."""
+    base, ext = os.path.splitext(out)
+    frames_dir = base + "_frames"
+    os.makedirs(frames_dir, exist_ok=True)
+    r = scene.render
+    r.filepath = os.path.join(frames_dir, "frame_")
+    r.image_settings.file_format = "PNG"
+    r.use_file_extension = True
+    r.use_persistent_data = True          # only the camera moves: keep the BVH between frames
+    r.use_overwrite = False               # skip frames that already exist
+    total = scene.frame_end - scene.frame_start + 1
+    t0 = time.time()
+    done = [0]
+
+    def on_write(sc, *_):
+        done[0] += 1
+        per = (time.time() - t0) / done[0]
+        log(f"frame {sc.frame_current}/{sc.frame_end} written  ({per:.0f} s/frame, "
+            f"~{per * (total - done[0]) / 60:.0f} min left)")
+    bpy.app.handlers.render_write.append(on_write)
+    log(f"rendering {total} frames at {opts.res[0]}x{opts.res[1]} @ {opts.samples} samples -> {frames_dir}")
+    bpy.ops.render.render(animation=True, scene=scene.name)
+    bpy.app.handlers.render_write.remove(on_write)
+    if ext.lower() in (".mp4", ".mkv", ".mov"):
+        encode_video(frames_dir, out, opts.fps, opts.res)
+
+
+def encode_video(frames_dir, out, fps, res):
+    """Encode the PNG frames to H.264 with Blender's own FFmpeg (via the sequencer)."""
+    files = sorted(f for f in os.listdir(frames_dir) if f.startswith("frame_") and f.endswith(".png"))
+    if not files:
+        return
+    enc = bpy.data.scenes.new("Encode")
+    enc.render.engine = "CYCLES"          # never used: the sequencer output is what gets written
+    se = enc.sequence_editor_create()
+    strips = se.strips if hasattr(se, "strips") else se.sequences
+    strip = strips.new_image("frames", os.path.join(frames_dir, files[0]), 1, 1)
+    for f in files[1:]:
+        strip.elements.append(f)
+    enc.frame_start, enc.frame_end = 1, len(files)
+    enc.render.fps = fps
+    enc.render.resolution_x, enc.render.resolution_y = res
+    enc.render.resolution_percentage = 100
+    im = enc.render.image_settings
+    if hasattr(im, "media_type"):         # Blender 5
+        im.media_type = "VIDEO"
+    im.file_format = "FFMPEG"
+    ff = enc.render.ffmpeg
+    ff.format, ff.codec = ("QUICKTIME" if out.lower().endswith(".mov") else
+                           "MKV" if out.lower().endswith(".mkv") else "MPEG4"), "H264"
+    ff.constant_rate_factor = "HIGH"
+    ff.ffmpeg_preset = "GOOD"
+    enc.view_settings.view_transform = "Standard"   # the frames are already tone-mapped
+    enc.view_settings.look = "None"
+    enc.view_settings.exposure = 0.0
+    enc.render.filepath = out
+    enc.render.use_file_extension = False
+    log(f"encoding {len(files)} frames -> {out}")
+    bpy.ops.render.render(animation=True, scene=enc.name)
+    bpy.data.scenes.remove(enc)
+    log(f"wrote {out}")
+
+
 def main():
     opts = parse_args()
     log(f"Blender {bpy.app.version_string}, preset={opts.preset}, seed={opts.seed}, season={opts.season}")
@@ -2217,7 +2403,9 @@ def main():
     if opts.save:
         bpy.ops.wm.save_as_mainfile(filepath=bpy.path.abspath(opts.save), compress=True)
         log(f"saved {opts.save}")
-    if opts.render:
+    if opts.render and opts.animate:
+        render_animation(scene, bpy.path.abspath(opts.render), opts)
+    elif opts.render:
         scene.render.filepath = bpy.path.abspath(opts.render)
         if opts.render.lower().endswith(".exr"):          # linear, un-tonemapped HDR
             scene.render.image_settings.file_format = "OPEN_EXR"

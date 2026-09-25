@@ -64,13 +64,15 @@ python forest_scene.py --preset final --render forest_1440p.png
 
 | option | meaning |
 |---|---|
-| `--preset draft\|preview\|final` | resolution, samples and scatter density (see below) |
+| `--preset draft\|preview\|final\|video` | resolution, samples and scatter density (see below) |
 | `--res WxH`, `--samples N` | override the preset |
 | `--gpu` | render on the GPU (OptiX, CUDA, HIP, Metal or oneAPI) |
 | `--seed N` | a different forest layout (default 7) |
 | `--season autumn` | autumn foliage and litter colours |
 | `--no-fog` | skip the volumetric haze (much faster, loses the light shafts) |
-| `--render PATH` | render a still. A `.exr` path writes linear HDR |
+| `--render PATH` | render a still. A `.exr` path writes linear HDR. With `--animate`, a `.mp4` path gets the encoded video |
+| `--animate SECONDS` | walk the camera down the path for this long (see *Camera move* below) |
+| `--fps N`, `--speed M_PER_S` | frame rate (default 24) and walking speed (default 1.4 m/s) |
 | `--save PATH` | save the generated `.blend` |
 | `--threads N` | limit the CPU render threads |
 
@@ -79,11 +81,37 @@ python forest_scene.py --preset final --render forest_1440p.png
 | `draft` | 960 × 540 | 32 | 45 % |
 | `preview` | 1280 × 720 | 48 | 100 % |
 | `final` | 2560 × 1440 (1440p) | 48 | 100 % |
+| `video` | 960 × 540 | 12 (lighter bounce budget) | 100 % |
 
 The `final` image above took **26 minutes** on a 4-core Xeon CPU with no GPU, including about
 1 minute of scene generation. `draft` and `preview` are proportionally quicker. A GPU
 (`--gpu`) should be much faster, but I couldn't measure one here. For a cleaner image, raise
 `--samples`; the time scales about linearly.
+
+## Camera move (video)
+
+`--animate SECONDS` turns the still into a shot that walks down the footpath at eye height.
+The camera looks about 9 m ahead along the path and has a faint handheld drift, and it
+passes the big beech and the fallen log.
+
+```bash
+# 10 s walk, 960x540 (this is what renders/forest_walk_10s.mp4 used)
+blender -b -P forest_scene.py -- --preset video --animate 10 --render forest_walk.mp4
+
+# the same shot at 1440p, on a GPU
+blender -b -P forest_scene.py -- --preset final --animate 10 --gpu --render forest_walk_1440p.mp4
+```
+
+- **Frames and encoding.** Frames are written as PNGs to `<name>_frames/` and then encoded
+  to H.264 with Blender's own FFmpeg, so there's nothing extra to install. Re-running the
+  same command skips frames that already exist, so an interrupted render resumes.
+- **Scatter coverage.** Ground cover is scattered for everything the camera sees along the
+  whole move, not just the first frame.
+- **Persistent data.** Only the camera moves, so Cycles keeps the scene between frames and
+  only the first frame pays the setup cost.
+- **Render time.** On the 4-core CPU used here, a 960×540 test frame at 16 samples took about
+  70 s. The `video` preset trims that with 12 samples and a lighter bounce budget. 1440p costs
+  about 7× more per frame, which is why that command is GPU territory.
 
 ## Tweaking
 
@@ -99,9 +127,10 @@ All the art direction lives at the top of `forest_scene.py`:
 ## Things to know
 
 - **Scattering follows the camera.** Leaf litter, ferns, grass, twigs, rocks and saplings
-  are only generated inside the camera's view cone, which keeps memory reasonable. If you
-  move the camera in Blender, you'll find bare ground outside the original view. To reframe,
-  change `LOOK` and re-run the script.
+  are only generated inside what the camera sees: the view cone for a still, or the whole
+  move with `--animate`. That keeps memory reasonable. If you move the camera by hand in
+  Blender, you'll find bare ground outside the original view. To reframe, change `LOOK` (or
+  `PATH_POINTS`) and re-run the script.
 - **The viewport shows a subset of the instances.** It displays only 10–50% of them (a
   Geometry Nodes *Is Viewport* switch) to stay interactive. Renders always get everything.
 - **It's procedural, not photoscanned.** The scene holds up at the framing it was built
