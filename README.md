@@ -80,8 +80,8 @@ python forest_scene.py --preset final --render forest_1440p.png
 | `preview` | 1280 × 720 | 48 | 100 % |
 | `final` | 2560 × 1440 (1440p) | 48 | 100 % |
 
-The `final` image above took **FINAL_TIME** on a 4-core Xeon CPU with no GPU, including about
-1.5 minutes of scene generation. `draft` and `preview` are proportionally quicker. A GPU
+The `final` image above took **26 minutes** on a 4-core Xeon CPU with no GPU, including about
+1 minute of scene generation. `draft` and `preview` are proportionally quicker. A GPU
 (`--gpu`) should be much faster, but I couldn't measure one here. For a cleaner image, raise
 `--samples`; the time scales about linearly.
 
