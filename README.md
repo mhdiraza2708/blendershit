@@ -141,6 +141,17 @@ blender -b -P forest_scene.py -- --preset final --save forest.blend
 blender -b -P forest_scene.py -- --preset final --animate 10 --save forest_walk.blend
 ```
 
+**Prebuilt file.** The 10 s walk version (the exact file used for the video) is in
+[`blend/`](blend/) as four pieces of one xz archive (363 MB total, 628 MB extracted; Blender 5.0).
+Download all four, put them in one folder, then:
+
+- **Windows / 7-Zip:** right-click `forest_full.blend.xz.001` › 7-Zip › *Extract here*, then
+  right-click the resulting `forest_full.blend.xz` › *Extract here* again.
+- **Windows (no 7-Zip):** `copy /b forest_full.blend.xz.001+forest_full.blend.xz.002+forest_full.blend.xz.003+forest_full.blend.xz.004 forest_full.blend.xz`, then extract with 7-Zip.
+- **macOS / Linux:** `cat forest_full.blend.xz.00* > forest_full.blend.xz && xz -d forest_full.blend.xz`
+
+The sha256 of the reassembled `.xz` is `49b43082200a3f1ac887af708ee8cc43e069c9e0b9661f6e136c1280cc50201f`.
+
 Or open `forest_scene.py` in Blender's *Scripting* workspace and run it, then use
 *File › Save As*. A `.blend` saved from Blender 5.0 opens in 5.0 or newer. Generate it with
 your own Blender version if you use 4.x.
