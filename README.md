@@ -153,6 +153,11 @@ That single ZIP contains the four pieces in its `blend/` folder. Put them in one
 
 The sha256 of the reassembled `.xz` is `49b43082200a3f1ac887af708ee8cc43e069c9e0b9661f6e136c1280cc50201f`.
 
+**Known issue in this prebuilt file:** it was saved before a viewport bug was fixed, so the 3D
+viewport shows only the terrain, rocks and the foreground tree (renders are fine). Open the
+file, run [`fix_viewport.py`](fix_viewport.py) from the *Scripting* workspace, then save. Files
+generated with the current `forest_scene.py` don't need it.
+
 Or open `forest_scene.py` in Blender's *Scripting* workspace and run it, then use
 *File › Save As*. A `.blend` saved from Blender 5.0 opens in 5.0 or newer. Generate it with
 your own Blender version if you use 4.x.

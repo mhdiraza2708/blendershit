@@ -1543,7 +1543,8 @@ def instancer_group(name, collection, viewport_fraction=1.0):
         orr.operation = "OR"
         L.new(isv.outputs[0], notv.inputs[0])
         L.new(notv.outputs[0], orr.inputs[0])
-        L.new(NB.sock(rnd.outputs, "Value"), orr.inputs[1])
+        # the node has one "Value" output per data type; link the enabled boolean one
+        L.new(next(s for s in rnd.outputs if s.enabled and s.type == "BOOLEAN"), orr.inputs[1])
         L.new(orr.outputs[0], iop.inputs["Selection"])
     L.new(iop.outputs[0], go.inputs[0])
     return ng
@@ -1989,6 +1990,16 @@ def setup_compositor(scene):
     L.new(vig_out, final_input)
 
 
+def open_in_camera_view():
+    """Point every 3D viewport at the scene camera, so the file opens on the shot."""
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                for space in area.spaces:
+                    if space.type == "VIEW_3D" and space.region_3d is not None:
+                        space.region_3d.view_perspective = "CAMERA"
+
+
 # -----------------------------------------------------------------------------
 #  Scene assembly
 # -----------------------------------------------------------------------------
@@ -2109,7 +2120,7 @@ def build_forest(opts):
         rot = np.stack([nrng.normal(0, 0.015, k), nrng.normal(0, 0.015, k), nrng.uniform(0, 2 * np.pi, k)], axis=1)
         s = nrng.uniform(0.85, 1.12, k)
         scatter_object(f"Trees_{sp_name}", np.column_stack([P, z]), rot, np.repeat(s[:, None], 3, axis=1),
-                       nrng.integers(0, count, k), c_trees, coll, viewport_fraction=0.2)
+                       nrng.integers(0, count, k), c_trees, coll, viewport_fraction=0.08)
         obstacles.add(P[:, 0], P[:, 1], np.full(k, 0.55))
 
     # --- saplings ----------------------------------------------------------------
@@ -2236,6 +2247,11 @@ def build_forest(opts):
         setup_compositor(scene)
     except Exception as exc:        # the finish is optional; never lose the scene over it
         log(f"compositor setup skipped: {exc!r}")
+
+    try:
+        open_in_camera_view()
+    except Exception as exc:        # cosmetic only
+        log(f"camera view not set: {exc!r}")
 
     # keep the asset library out of the render; the instancers still read it
     scene.view_layers[0].layer_collection.children[assets.name].exclude = True
