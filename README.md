@@ -143,7 +143,8 @@ blender -b -P forest_scene.py -- --preset final --animate 10 --save forest_walk.
 
 **Prebuilt file.** The 10 s walk version (the exact file used for the video) is in
 [`blend/`](blend/) as four pieces of one xz archive (363 MB total, 628 MB extracted; Blender 5.0).
-Download all four, put them in one folder, then:
+The one-click way: on the repo page choose *Code › Download ZIP* (with this branch selected).
+That single ZIP contains the four pieces in its `blend/` folder. Put them in one folder, then:
 
 - **Windows / 7-Zip:** right-click `forest_full.blend.xz.001` › 7-Zip › *Extract here*, then
   right-click the resulting `forest_full.blend.xz` › *Extract here* again.
