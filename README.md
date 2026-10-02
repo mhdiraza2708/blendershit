@@ -127,6 +127,24 @@ All the art direction lives at the top of `forest_scene.py`:
   leaves per metre, leaf size).
 - `PRESETS`: resolution, samples and density per preset.
 
+## Getting a .blend file
+
+The `.blend` isn't in the repo: the scene holds about 17 million vertices (mostly individual
+leaves), which makes the saved file about 630 MB, over GitHub's 100 MB per-file limit. It's
+reproducible in about two minutes instead:
+
+```bash
+# still, 1440p settings
+blender -b -P forest_scene.py -- --preset final --save forest.blend
+
+# same, with the camera keyframed for the 10 s walk (frames 1-240)
+blender -b -P forest_scene.py -- --preset final --animate 10 --save forest_walk.blend
+```
+
+Or open `forest_scene.py` in Blender's *Scripting* workspace and run it, then use
+*File › Save As*. A `.blend` saved from Blender 5.0 opens in 5.0 or newer. Generate it with
+your own Blender version if you use 4.x.
+
 ## Things to know
 
 - **Scattering follows the camera.** Leaf litter, ferns, grass, twigs, rocks and saplings
