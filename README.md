@@ -1,3 +1,108 @@
+# Procedural Blender scenes
+
+Two self-contained Python generators. Neither downloads textures, HDRIs or models.
+
+- [**Airliner**](#airliner--807-separate-parts-five-display-modes): a twin-engine passenger jet built from 807 separate parts, with finished, X-ray, cutaway, exploded and laid-out modes (`airliner.py`)
+- [**Forest**](#procedural-photorealistic-forest--blender--cycles): a photorealistic beech and oak forest at sunrise (`forest_scene.py`)
+
+---
+
+# Airliner — 807 separate parts, five display modes
+
+![The finished airliner](renders/airliner_finished.png)
+
+`airliner.py` builds a generic narrow-body twin jet (A320/737 class, about 37.6 m long with a
+35.8 m span) as **807 individual objects**. Every panel, rib, seat and fan blade is its own part
+and can be selected, hidden or moved on its own. A sidebar panel switches between five modes and
+shows a live part count.
+
+| X-ray | Cutaway |
+|---|---|
+| ![X-ray](renders/airliner_xray.png) | ![Cutaway](renders/airliner_cutaway.png) |
+| **Exploded** | **Laid out** |
+| ![Exploded](renders/airliner_exploded.png) | ![Laid out](renders/airliner_layout.png) |
+
+## The modes
+
+| mode | what it does |
+|---|---|
+| **Finished** | the complete aircraft, parked on its gear |
+| **X-ray** | the outer skin (315 parts) turns to cyan glass. Everything inside glows in its system colour: structure white, cabin amber, flight deck orange, engines red-orange, landing gear magenta, cargo and systems green |
+| **Cutaway** | a stepped section of skin is removed down the left side, along with the left overhead bins, the upper skin of the left wing, half the left engine's cowls and casings, and the left skins of the fin and stabiliser. 101 parts are hidden and the count drops to 706 |
+| **Exploded** | every part moves away from its neighbours along its own assembly direction: skin panels radially outwards, cabin and flight deck up in a layer above, wings outboard, the engines apart along their axis with the fan blades flung radially, and the gear down. A slider sets the distance (0–2.5×) and updates live |
+| **Laid out** | every part is laid flat on the floor, sorted by size and grouped into labelled blocks per system, each label showing its part count. Thin parts are laid on their widest face, and tall parts such as struts and the rudder are laid down |
+
+Switching modes animates the parts to their new positions, and the camera moves to a framing
+that suits each mode. Both can be turned off in the panel.
+
+## What's modelled (part counts)
+
+| system | parts | includes |
+|---|---|---|
+| Fuselage | 202 | radome, 112 skin panels (14 sections × 8) carrying a painted livery, tail cone, APU exhaust, 70 cabin windows, 6 flight-deck windows, 10 doors and exits (with seals), belly fairing |
+| Structure | 208 | 33 frames, 66 stringers (spliced at three production breaks), cabin floor panels and beams, forward and aft pressure bulkheads, keel beam, centre wing box; wing, fin and stabiliser spars and ribs |
+| Cabin | 146 | 12 business and 102 economy seats, 24 overhead bins, galleys, lavatories, cabin dividers |
+| Engines | 114 | per engine: inlet lip and cowl, split fan cowls, fan cases, thrust reversers and core cowls, spinner, fan disk, **24 fan blades**, outlet guide vanes, 3 booster, 5 HP compressor, 1 HP turbine and 4 LP turbine stages, combustor, 2 shafts, nozzle, plug, pylon, pylon fairing |
+| Wings | 66 | per wing: 3 upper and 3 lower skins, trailing-edge panels, fixed leading edges, 5 slats, 2 flaps, aileron, 5 spoilers, 3 flap-track fairings, winglet, navigation light |
+| Landing gear | 31 | nose and main struts, pistons, braces, torque links, axles, tyres and hubs, gear doors |
+| Tail | 19 | fin leading edge, skins, rudder, tip and dorsal fillet; stabiliser leading edges, skins, elevators and tips |
+| Cargo & systems | 11 | 6 LD3 containers, cargo floors, APU, two air-conditioning packs |
+| Flight deck | 10 | bulkhead and door, pilot and observer seats, instrument panel with lit displays, glareshield, pedestal, overhead panel, sidesticks |
+
+## Usage
+
+**Blender GUI (4.2 or newer):** open `airliner.py` in the *Scripting* workspace and press
+*Run Script*. The aircraft is built into a new scene called **Airliner** in about a second.
+Press **N** in the 3D viewport and open the **Airliner** tab.
+
+**Prebuilt file:** [`blend/airliner.blend`](blend/airliner.blend) (1.2 MB, saved from Blender
+5.0). The mode panel is stored inside it as the text block `airliner_ui.py`. Blender doesn't run
+scripts from a file until you allow it. Click **Allow Execution** in the warning bar, or open the
+text block in the Text Editor and press *Run Script*.
+
+**Command line:**
+
+```bash
+# the five renders above (1920x1080, Cycles, 64 samples)
+blender -b -P airliner.py -- --render-all renders/
+
+# one mode
+blender -b -P airliner.py -- --mode cutaway --render cutaway.png
+
+# build and save a .blend
+blender -b -P airliner.py -- --save airliner.blend
+```
+
+Without a Blender install, `pip install bpy` (Python 3.11) and run `python airliner.py ...` with
+the same options.
+
+| option | meaning |
+|---|---|
+| `--mode finished\|xray\|cutaway\|exploded\|layout` | the mode to render and to leave the scene in |
+| `--explode F` | explode distance multiplier (default 1.0) |
+| `--render PATH` | render the chosen mode |
+| `--render-all DIR` | render all five modes as `DIR/airliner_<mode>.png` |
+| `--res WxH`, `--samples N` | resolution (default 1920x1080) and Cycles samples (default 64) |
+| `--no-hud` | leave the caption and part count out of the renders |
+| `--save PATH` | save the `.blend` |
+
+Each 1080p render takes 1–2 minutes on a 4-core CPU.
+
+## Things to know
+
+- **It's a generic airliner, not a specific type.** The proportions follow the A320/737 class
+  and the livery is made up. It's built for clarity at whole-aircraft scale, so there are no
+  rivets, hinges, wiring or hydraulic lines.
+- **Parts are in their real positions.** Each part's origin sits at its own centre, so you can
+  grab any part in Finished mode and move it. Mode switches restore the stored positions, so
+  hand edits are overwritten by the next mode change.
+- **X-ray in the viewport** needs *Material Preview* or *Rendered* shading. The script switches
+  the viewport to Material Preview for you.
+- **Running the script again** in the same file makes a second, independent Airliner scene. The
+  panel only counts and moves the parts of the scene you're looking at.
+
+---
+
 # Procedural photorealistic forest — Blender + Cycles
 
 ![Misty beech and oak forest at sunrise](renders/forest_1440p.png)
