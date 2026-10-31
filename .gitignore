@@ -4,3 +4,6 @@ __pycache__/
 *.exr
 renders/*_frames/
 *.blend
+
+textures/
+!blend/cyberpunk_city.blend
