@@ -22,6 +22,22 @@ shows a live part count.
 | **Exploded** | **Laid out** |
 | ![Exploded](renders/airliner_exploded.png) | ![Laid out](renders/airliner_layout.png) |
 
+**Video:** [`renders/airliner_modes.mp4`](renders/airliner_modes.mp4) is a 31-second tour through
+all five modes (1280 × 720, 24 fps, EEVEE). Cutaway panels peel off one by one while the
+caption counts down the parts still shown. The parts then explode by system, arc down onto the
+floor into the parts sheet, and finally fly back in and reassemble the plane system by system,
+from the frames and floor up to the skin. Render it again with:
+
+```bash
+blender -b -P airliner_video.py -- --out renders/airliner_modes.mp4
+```
+
+`--engine cycles` switches to Cycles (slower), `--res` and `--fps` change the format, and
+`--frames 0-47` renders a short range as a preview. Frames are written to
+`renders/airliner_modes_frames/` and reused if the render is interrupted. On this 4-core
+machine with no GPU, EEVEE ran on the Mesa software renderer at about 15 s per frame. A GPU is
+much faster.
+
 ## The modes
 
 | mode | what it does |
