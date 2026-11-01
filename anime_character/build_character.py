@@ -2,24 +2,33 @@
 """
 build_character.py - a game-ready anime character for Blender, built entirely by code.
 
-The body is box-modelled the way a character artist would do it: a low-resolution quad
-cage with deliberate edge loops (three loops per joint, four-sided finger rings,
-concentric eye and mouth loops), then one Catmull-Clark subdivision gives the game-res
-mesh. The head is shaped by projecting its cage onto a sculpted signed-distance field.
+Pipeline
+--------
+1. Body: box-modelled the way a character artist would do it. A low-resolution quad cage with
+   deliberate edge loops (three loops per joint, four-sided finger rings, a diamond-quad groin,
+   concentric eye and mouth loops, ear sockets), then one Catmull-Clark subdivision gives the
+   game-resolution mesh. The head cage is projected onto a sculpted signed-distance field (a
+   lofted head measured off an anime reference) and relaxed around the facial features.
+2. Face: socket walls, sphere-cap eyeballs with a generated iris texture, lashes, brows, a
+   mouth bag.
+3. Hair (scalp cap + draped ribbon locks), pleated skirt, sailor collar with bow, outfit colours.
+4. UVs: seams on region borders plus one hidden cut per tube, angle-based unwrap, packed.
+5. Rig: game skeleton (97 deform bones incl. spring-bone chains for hair and skirt), IK/FK
+   controls, skin weights limited to 4 per vertex, face shape keys (blinks, visemes, smile).
+6. Exports: .blend, FBX (deform bones only) and GLB.
 
 Usage
 -----
     blender -b -P build_character.py -- --save anime_character.blend
     blender -b -P build_character.py -- --save out.blend --fbx out.fbx --glb out.glb
 
-Python with the PyPI `bpy` module also works:  python build_character.py --save out.blend
+Tested with Blender 4.5 LTS. Takes about a minute on a 4-core CPU.
 """
 
 import argparse
 import math
 import os
 import sys
-from collections import deque
 
 import bpy
 import bmesh
@@ -1790,13 +1799,13 @@ def build_hair(body):
         path = resample(path, nseg)
         vs = build_lock(bm, uv, path, w, h, 0, s_layer, g_layer, HAIR_GROUPS[grp], curl)
         locks.append((grp, psi, path))
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))   # every lock is a closed tube
     bm.to_mesh(me)
     bm.free()
     ob = bpy.data.objects.new("Hair", me)
     bpy.context.scene.collection.objects.link(ob)
     me.shade_smooth()
     assign_materials(ob, ["hair"])
-    ob["locks"] = 0
     return ob, locks
 
 
@@ -1945,12 +1954,10 @@ def build_collar(body):
         build_lock(bm, uv, pts, w, 0.0016, 2, None, None, 0, taper=False)
     k0 = len(bm.verts)
     bmesh.ops.create_cube(bm, size=1.0, matrix=Matrix.Translation(knot_c) @ Matrix.Diagonal((0.013, 0.008, 0.013, 1)))
-    for f in bm.faces:
-        if f.material_index == 0 and all(v.index >= k0 for v in f.verts if v.index >= 0):
-            pass
     bm.faces.ensure_lookup_table()
     for f in bm.faces[-6:]:
         f.material_index = 2
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
     ob = bpy.data.objects.new("Collar", me)
     bpy.context.scene.collection.objects.link(ob)
     assign_materials(ob, ["collar", "top", "ribbon"])     # slots first: indices are clamped
@@ -2000,6 +2007,128 @@ def assign_outfit(body, parts):
         if z < 0.105 and abs(c.x) < 0.13:
             mat = "shoes"
         poly.material_index = MAT[mat]
+
+
+# =============================================================================
+#  UVs
+# =============================================================================
+
+REGION_OF_GROUP = {"torso": "torso", "arm": "arm", "hand": "hand", "leg": "leg", "foot": "foot",
+                   "neck": "neck", "neckring": "neck", "head": "head", "eye_region": "head",
+                   "mouth_region": "head", "ear": "ear"}
+
+
+def body_regions(ob):
+    """Label every face with a body region (+ side) from the construction vertex groups."""
+    names = {g.index: g.name for g in ob.vertex_groups}
+    vlab = []
+    for v in ob.data.vertices:
+        best, bw = "detail", 0.0
+        for g in v.groups:
+            n = names[g.group]
+            if n.startswith("finger_"):
+                n = "hand"
+            r = REGION_OF_GROUP.get(n)
+            if r and g.weight > bw:
+                best, bw = r, g.weight
+        vlab.append(best)
+    labels = []
+    for p in ob.data.polygons:
+        counts = {}
+        for i in p.vertices:
+            counts[vlab[i]] = counts.get(vlab[i], 0) + 1
+        r = max(counts, key=counts.get)
+        if r in ("arm", "hand", "leg", "foot", "ear"):
+            r += ".L" if p.center.x > 0 else ".R"
+        labels.append(r)
+    return labels
+
+
+def limb_frame(p, path, side):
+    """Closest point on a limb polyline, its direction and the limb frame there."""
+    best = None
+    for a, b in zip(path, path[1:]):
+        ab = b - a
+        u = clamp((p - a).dot(ab) / ab.length_squared, 0.0, 1.0)
+        c = a + ab * u
+        d2 = (p - c).length_squared
+        if best is None or d2 < best[0]:
+            best = (d2, c, ab.normalized())
+    _, c, d = best
+    uf, uu = frame_at(d, side)
+    return c, d, uf, uu
+
+
+def unwrap_body(body, parts):
+    labels = body_regions(body)
+    bm = bmesh.new()
+    bm.from_mesh(body.data)
+    bm.faces.ensure_lookup_table()
+    eye_mat = MAT["eye"]
+    hands = {s: parts["arms"][s]["hand"] for s in (-1, 1)}
+    for e in bm.edges:
+        if len(e.link_faces) != 2:
+            continue
+        f0, f1 = e.link_faces
+        l0, l1 = labels[f0.index], labels[f1.index]
+        m = (e.verts[0].co + e.verts[1].co) / 2
+        dvec = (e.verts[1].co - e.verts[0].co).normalized()
+        seam = l0 != l1
+        on_center = abs(e.verts[0].co.x) < 1e-5 and abs(e.verts[1].co.x) < 1e-5
+        if not seam and l0 in ("head", "neck", "torso") and on_center and m.y > 0.0:
+            seam = True                                     # cut down the back
+        if not seam and l0 == "head" and (f0.calc_center_median().y < 0.012) != (f1.calc_center_median().y < 0.012):
+            seam = True                                     # face island | back of the head
+        if not seam and l0.startswith("arm"):
+            side = 1 if l0.endswith(".L") else -1
+            a = parts["arms"][side]
+            c, d, uf, uu = limb_frame(m, [a["S"], a["E"], a["W"]], side)
+            r = m - c
+            ang = math.degrees(math.atan2(r.dot(uu), r.dot(uf)))
+            seam = abs(dvec.dot(d)) > 0.7 and abs(angle_wrap(math.radians(ang + 90))) < math.radians(9.5)
+        if not seam and l0.startswith("leg"):
+            side = 1 if l0.endswith(".L") else -1
+            path = [V((side * q.x, q.y, q.z)) for q in (HIP, KNEE, ANKLE)]
+            c, d, uf, uu = limb_frame(m, path, side)
+            r = m - c
+            ang = math.degrees(math.atan2(-side * r.x, -r.y))     # 90 = inner side
+            seam = abs(dvec.dot(d)) > 0.7 and abs(ang - 90) < 9.5
+        if not seam and l0.startswith("hand"):                  # back of the hand | palm
+            uu = hands[1 if l0.endswith(".L") else -1]["uu"]
+            seam = (f0.normal.dot(uu) > 0) != (f1.normal.dot(uu) > 0)
+        if not seam and l0.startswith("foot"):                  # sole | upper
+            seam = (f0.normal.z < -0.6) != (f1.normal.z < -0.6)
+        e.seam = seam
+    bm.to_mesh(body.data)
+    bm.free()
+    # unwrap everything except the eyeballs, which keep their own UVs for the iris texture
+    for p in body.data.polygons:
+        p.select = p.material_index != eye_mat
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    body.select_set(True)
+    bpy.context.view_layer.objects.active = body
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_mode(type="FACE")
+    bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.003)
+    bpy.ops.uv.select_all(action="SELECT")
+    bpy.ops.uv.pack_islands(rotate=True, margin=0.004)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    for p in body.data.polygons:
+        p.select = False
+
+
+def unwrap_hair_cap(hair):
+    """The locks already have strand UVs; give the cap a top-down projection in the same space."""
+    me = hair.data
+    g = me.attributes["hair_group"].data
+    uv = me.uv_layers.active.data
+    for p in me.polygons:
+        if all(g[i].value == HAIR_GROUPS["cap"] for i in p.vertices):
+            for li in p.loop_indices:
+                co = me.vertices[me.loops[li].vertex_index].co
+                ang = math.atan2(co.x, -(co.y - 0.02))
+                uv[li].uv = (0.5 + ang / (2 * math.pi), clamp((co.z - 1.38) / 0.22, 0.0, 1.0))
 
 
 # =============================================================================
@@ -2238,12 +2367,20 @@ def set_weights(ob, weights_per_vertex):
             groups[name].add([i], w / tot, "REPLACE")
 
 
-def clean_weights(ob, limit=4):
-    with bpy.context.temp_override(object=ob, active_object=ob, selected_objects=[ob],
-                                   selected_editable_objects=[ob]):
-        bpy.ops.object.vertex_group_clean(group_select_mode="ALL", limit=0.01)
-        bpy.ops.object.vertex_group_limit_total(group_select_mode="ALL", limit=limit)
-        bpy.ops.object.vertex_group_normalize_all(group_select_mode="ALL", lock_active=False)
+def clean_weights(ob, limit=4, floor=0.01):
+    """Game-engine friendly skinning: at most `limit` bones per vertex, tiny weights dropped,
+    weights normalized to 1."""
+    groups = list(ob.vertex_groups)
+    for v in ob.data.vertices:
+        ws = sorted(((g.weight, g.group) for g in v.groups if g.weight > 0.0), reverse=True)
+        keep = [(w, gi) for w, gi in ws[:limit] if w >= floor] or ws[:1]
+        tot = sum(w for w, _ in keep) or 1.0
+        keep_ids = {gi for _, gi in keep}
+        for w, gi in ws:
+            if gi not in keep_ids:
+                groups[gi].remove([v.index])
+        for w, gi in keep:
+            groups[gi].add([v.index], w / tot, "REPLACE")
 
 
 def bind(ob, arm):
@@ -2691,6 +2828,28 @@ def clear_scene():
             coll.remove(item)
 
 
+def export_fbx(path):
+    bpy.ops.export_scene.fbx(filepath=path, use_selection=False, object_types={"ARMATURE", "MESH"},
+                             use_mesh_modifiers=False, mesh_smooth_type="FACE", add_leaf_bones=False,
+                             use_armature_deform_only=True, bake_anim=False, path_mode="COPY",
+                             embed_textures=True, apply_scale_options="FBX_SCALE_ALL",
+                             axis_forward="-Z", axis_up="Y")
+
+
+def export_glb(path):
+    bpy.ops.export_scene.gltf(filepath=path, export_format="GLB", export_skins=True, export_morph=True,
+                              export_animations=False, export_def_bones=True, export_apply=False)
+
+
+def summary(objs):
+    total = 0
+    for ob in objs:
+        tris = sum(len(p.vertices) - 2 for p in ob.data.polygons)
+        total += tris
+        print("  %-8s %6d tris" % (ob.name, tris))
+    print("  %-8s %6d tris" % ("total", total))
+
+
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
     ap = argparse.ArgumentParser()
@@ -2724,6 +2883,8 @@ def main():
     assign_outfit(body, parts)
     collar = build_collar(body)
     report_mesh(collar)
+    unwrap_body(body, parts)
+    unwrap_hair_cap(hair)
     arm, chains = build_armature(parts, face, locks)
     add_shape_keys(body, features, face)
     weight_body(body, arm, face)
@@ -2731,9 +2892,20 @@ def main():
     weight_skirt(skirt, arm, chains)
     bow = {i for p in collar.data.polygons if p.material_index == 2 for i in p.vertices}
     weight_from_body(collar, body, arm, rigid=lambda v: {"UpperChest": 1.0} if v.index in bow else None)
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    bpy.context.view_layer.objects.active = arm
+    summary([body, hair, skirt, collar])
+    print("bones: %d deform / %d total" % (sum(b.use_deform for b in arm.data.bones), len(arm.data.bones)))
     if args.save:
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(args.save), compress=True)
         print("saved", args.save)
+    if args.fbx:
+        export_fbx(os.path.abspath(args.fbx))
+        print("exported", args.fbx)
+    if args.glb:
+        export_glb(os.path.abspath(args.glb))
+        print("exported", args.glb)
 
 
 if __name__ == "__main__":

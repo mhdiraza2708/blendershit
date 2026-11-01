@@ -4,3 +4,4 @@ __pycache__/
 *.exr
 renders/*_frames/
 *.blend
+!anime_character/*.blend
