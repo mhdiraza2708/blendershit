@@ -2357,6 +2357,23 @@ def build_scene(opts, ad=True):
     return scene, M, ph
 
 
+def prepare_for_save(scene):
+    """Make the saved .blend self-contained and open on a useful view."""
+    for f in bpy.data.fonts:
+        if f.filepath and f.packed_file is None and os.path.exists(bpy.path.abspath(f.filepath)):
+            f.pack()                    # Inter is SIL OFL: fine to embed
+    scene.frame_current = SHOTS["reveal"][1] - 2
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for sp in area.spaces:
+                if sp.type == "VIEW_3D":
+                    sp.clip_start, sp.clip_end = 0.0005, 100.0     # the phone is 150 mm long
+                    if sp.region_3d is not None:
+                        sp.region_3d.view_perspective = "CAMERA"
+
+
 def main():
     opts = parse_args()
     if opts.edit:
@@ -2372,6 +2389,7 @@ def main():
     if opts.inspect:
         run_inspect(opts, scene, scene.collection)
     if opts.save:
+        prepare_for_save(scene)
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(opts.save), compress=True)
         log(f"saved {opts.save}")
     if opts.still:
