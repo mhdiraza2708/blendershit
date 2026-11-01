@@ -824,9 +824,9 @@ def mat_sensor(lg):
                    nb.math("ABSOLUTE", nb.math("SINE", nb.math("MULTIPLY", y, k))))
     fall = nb.mapr(r, 0.0, 5.0, 1.0, 0.25)
     col = nb.mix(nb.mapr(r, 0.5, 4.5), (0.42, 0.20, 1.0), (0.10, 0.25, 1.0))
-    amt = nb.math("MULTIPLY", nb.math("MULTIPLY", fall, nb.mapr(grid, 0.0, 1.0, 0.55, 1.0)), ctl.outputs["SensorGlow"])
+    amt = nb.math("MULTIPLY", nb.math("MULTIPLY", fall, nb.mapr(grid, 0.0, 1.0, 0.85, 1.0)), ctl.outputs["SensorGlow"])
     nb.output(nb.principled(base=(0.02, 0.02, 0.03), metal=1.0, rough=0.12, film=420.0, film_ior=1.6,
-                            emit=col, emit_str=nb.math("MULTIPLY", amt, 1.6)))
+                            emit=col, emit_str=nb.math("MULTIPLY", amt, 1.3)))
     return m
 
 
@@ -1242,13 +1242,13 @@ QUALITY = {
 }
 
 
-def setup_render(scene, res, samples, threads=0):
+def setup_render(scene, res, samples, threads=0, noise=0.05):
     scene.render.engine = "CYCLES"
     c = scene.cycles
     c.device = "CPU"
     c.samples = samples
     c.use_adaptive_sampling = True
-    c.adaptive_threshold = 0.02
+    c.adaptive_threshold = noise
     c.use_denoising = True
     try:
         c.denoiser = "OPENIMAGEDENOISE"
@@ -1259,7 +1259,7 @@ def setup_render(scene, res, samples, threads=0):
         pass
     c.max_bounces = 10
     c.diffuse_bounces = 2
-    c.glossy_bounces = 4
+    c.glossy_bounces = 3
     c.transmission_bounces = 8
     c.transparent_max_bounces = 8
     c.volume_bounces = 0
@@ -1634,13 +1634,39 @@ EXPLODE = {                               # mm along the phone's Z (+ = towards 
 EXPLODE_FAN = 0.75                        # layers also slide sideways, like a fanned deck
 
 
+def _fcurves(id_data):
+    ad = id_data.animation_data
+    if ad is None or ad.action is None:
+        return []
+    act = ad.action
+    if hasattr(act, "layers") and getattr(ad, "action_slot", None) is not None:   # slotted actions (4.4+)
+        try:
+            from bpy_extras import anim_utils
+            cb = anim_utils.action_get_channelbag_for_slot(act, ad.action_slot)
+            if cb is not None:
+                return cb.fcurves
+        except (ImportError, AttributeError):
+            pass
+    return getattr(act, "fcurves", [])
+
+
 def kf(owner, path, frame, value, interp="BEZIER", index=-1):
-    bpy.context.preferences.edit.keyframe_new_interpolation_type = interp
+    """Insert a keyframe and set its interpolation explicitly (keyframe_insert() from
+    Python ignores the user preference for new-key interpolation)."""
     if index >= 0:
         getattr(owner, path)[index] = value
     else:
         setattr(owner, path, value)
     owner.keyframe_insert(path, index=index, frame=frame)
+    try:
+        full = owner.path_from_id(path)
+    except (ValueError, TypeError):
+        full = path
+    for fc in _fcurves(owner.id_data):
+        if fc.data_path == full and (index < 0 or fc.array_index == index):
+            for kp in fc.keyframe_points:
+                if abs(kp.co.x - frame) < 1e-3:
+                    kp.interpolation = interp
 
 
 def kfs(owner, path, keys, interp="BEZIER", index=-1):
@@ -1690,7 +1716,7 @@ def backdrop(coll):
                                 nb.math("MULTIPLY", nb.out(oc, "Z"), nb.out(oc, "Z"))))
     g = nb.math("POWER", nb.mapr(r, 0.0, 0.55, 1.0, 0.0), 2.2)
     strength = nb.node("ShaderNodeValue", name="Strength", label="Strength")
-    strength.outputs[0].default_value = 0.06
+    strength.outputs[0].default_value = 0.085
     col = nb.mix(g, (0.0, 0.0, 0.0), (0.42, 0.44, 0.48))
     em = nb.node("ShaderNodeEmission", {"Color": col, "Strength": strength.outputs[0]})
     nb.output(em)
@@ -1793,10 +1819,13 @@ def build_ad(scene, root, M, ph, internals):
                                 (a + 72, 2.0), (a + 94, 3.0), (a + 100, 3.0), (a + 117, 4.0)])
 
     # ---------------------------------------------------------------- display wake
+    a3, b3 = S["inside"]
     a, b = S["hero"]
     on = gval(M["sg"], "On")
-    kfs(on, "default_value", [(1, 0.0), (a + 24, 0.0), (a + 30, 1.25), (a + 38, 1.0)])
-    kfs(gval(M["sg"], "Time"), "default_value", [(a, 0.0), (b, 2.2)], interp="LINEAR")
+    kfs(on, "default_value", [(1, 0.0), (a3 + 22, 0.0), (a3 + 46, 0.55), (b3 - 28, 0.55), (b3 - 10, 0.0),
+                              (a + 24, 0.0), (a + 30, 1.25), (a + 38, 1.0)])
+    kfs(gval(M["sg"], "Time"), "default_value", [(a3, 0.0), (b3, 0.8, "CONSTANT"), (a, 0.0), (b, 2.2)],
+        interp="LINEAR")
 
     # ---------------------------------------------------------------- cameras
     cams = {}
@@ -1880,12 +1909,16 @@ def build_ad(scene, root, M, ph, internals):
     strip_l = area_light("StripL", lights, (-0.30, 0.10, 0.02), (0, 0, 0), 0.05, 0.0, size_y=0.70)
     strip_r = area_light("StripR", lights, (0.30, 0.12, 0.05), (0, 0, 0), 0.05, 0.0, size_y=0.70, color=(0.92, 0.96, 1.0))
     top = area_light("Top", lights, (0.02, -0.05, 0.42), (0, 0, 0), 0.45, 0.0, size_y=0.45)
-    fill = area_light("Fill", lights, (0.25, -0.40, -0.18), (0, 0, 0), 0.6, 0.0, color=(0.85, 0.9, 1.0))
-    light_on(key, [S["reveal"], S["finish"], S["hero"]], [2.2, 1.4, 1.1])
-    light_on(strip_l, [S["reveal"], S["inside"], S["finish"], S["hero"]], [0.9, 0.5, 0.9, 0.9])
-    light_on(strip_r, [S["reveal"], S["inside"], S["finish"], S["hero"]], [0.9, 0.5, 0.9, 0.9])
+    fill = area_light("Fill", lights, (0.46, -0.12, -0.26), (0, 0, 0), 0.6, 0.0, color=(0.85, 0.9, 1.0))
+    light_on(key, [S["iris"], S["reveal"], S["finish"]], [1.4, 3.4, 2.1])
+    hk = area_light("HeroStrip", lights, (-0.30, -0.32, 0.22), (0, 0, 0), 0.03, 0.0, size_y=0.70, color=(1.0, 0.97, 0.94))
+    hs = area_light("HeroSoft", lights, (-0.10, -0.30, 0.45), (0, 0, 0), 0.45, 0.0, size_y=0.30)
+    light_on(hk, [S["hero"]], [1.0])
+    light_on(hs, [S["hero"]], [1.2])
+    light_on(strip_l, [S["iris"], S["reveal"], S["inside"], S["finish"], S["hero"]], [0.5, 1.3, 0.5, 1.9, 1.0])
+    light_on(strip_r, [S["iris"], S["reveal"], S["inside"], S["finish"], S["hero"]], [0.5, 1.3, 0.5, 1.9, 1.0])
     light_on(top, [S["finish"], S["hero"]], [1.2, 1.2])
-    light_on(fill, [S["reveal"], S["finish"], S["hero"]], [1.2, 1.2, 1.0])
+    light_on(fill, [S["iris"], S["reveal"], S["finish"], S["hero"]], [0.6, 1.2, 1.2, 1.0])
     ik = area_light("InsideKey", lights, (-0.16, -0.34, 0.36), (0, 0, 0), 0.55, 0.0, size_y=0.40, color=(1.0, 0.97, 0.94))
     ir = area_light("InsideRim", lights, (0.26, 0.28, 0.20), (0, 0, 0), 0.30, 0.0, color=(0.9, 0.95, 1.0))
     iu = area_light("InsideUnder", lights, (-0.32, 0.05, -0.28), (0, 0, 0), 0.40, 0.0, color=(1.0, 0.85, 0.8))
@@ -1913,7 +1946,6 @@ def build_ad(scene, root, M, ph, internals):
         scene.render.motion_blur_position = "START"     # no smearing across the cuts
     except (AttributeError, TypeError):
         scene.cycles.motion_blur_position = "START"
-    bpy.context.preferences.edit.keyframe_new_interpolation_type = "BEZIER"
     return cams
 
 
@@ -2054,7 +2086,7 @@ def make_soundtrack(path, seed=9):
         for fr, g in ((2380, 0.5), (3710, 0.35), (5150, 0.25)):
             x += g * np.sin(2 * np.pi * fr * np.arange(k) / SR) * _env(k, 0.0005, 0.045)
         x += 0.8 * np.sin(2 * np.pi * 70 * np.arange(k) / SR) * _env(k, 0.002, 0.05)
-        _place(buf, x, _f2s(f), 0.55, -0.2)
+        _place(buf, x, _f2s(f), 0.16, -0.2)
 
     def whoosh(t0, length, f0, f1, gain, pan0=-0.6, pan1=0.6):
         k = int(length * SR)
@@ -2112,7 +2144,7 @@ def make_soundtrack(path, seed=9):
     boom(_f2s(b3 - 6), 0.6, 140, 60, 0.6)
     a4, b4 = SHOTS["finish"]
     for i, f in enumerate((a4 + 12, a4 + 42, a4 + 72, a4 + 100)):
-        zap(_f2s(f), 0.35, -0.5 + i * 0.33)
+        zap(_f2s(f), 0.55, -0.5 + i * 0.33)
     beat = 60.0 / 100.0
     tb = _f2s(SHOTS["reveal"][0] + 24)
     while tb < _f2s(SHOTS["hero"][0] + 20):
@@ -2135,7 +2167,9 @@ def make_soundtrack(path, seed=9):
     wet *= 0.18 * np.abs(buf).max() / max(np.abs(wet).max(), 1e-9)
     mix = buf + wet
     mix *= np.interp(t, [0, 0.05, dur - 0.6, dur], [0, 1, 1, 0])
-    mix /= max(np.abs(mix).max(), 1e-9) / 0.89
+    mix /= max(np.percentile(np.abs(mix), 99.95), 1e-9)       # loudness from the body, not the spikes
+    mix = np.tanh(1.5 * mix) / np.tanh(1.5)                   # soft-clip limiter
+    mix /= max(np.abs(mix).max(), 1e-9) / 0.93
     pcm = (np.clip(mix.T, -1, 1) * 32767).astype("<i2")
     with wave.open(path, "wb") as w:
         w.setnchannels(2)
@@ -2270,7 +2304,9 @@ def parse_args():
     ap.add_argument("--quality", choices=QUALITY.keys(), default="final",
                     help="mesh density (final = 0.3 mm outline spacing)")
     ap.add_argument("--res", default="1920x1080")
-    ap.add_argument("--samples", type=int, default=48)
+    ap.add_argument("--samples", type=int, default=12,
+                    help="Cycles samples per pixel, denoised with OpenImageDenoise (raise on a GPU)")
+    ap.add_argument("--noise", type=float, default=0.05, help="adaptive-sampling noise threshold")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--save", default="", help="save the generated .blend here")
     ap.add_argument("--still", type=int, default=0, help="render this frame to --out")
@@ -2300,7 +2336,7 @@ def fresh_scene():
 def build_scene(opts, ad=True):
     scene = fresh_scene()
     root = scene.collection
-    setup_render(scene, opts.res, opts.samples, opts.threads)
+    setup_render(scene, opts.res, opts.samples, opts.threads, getattr(opts, "noise", 0.05))
     q = QUALITY[opts.quality]
     rig_coll = new_collection("Controls", root)
     rig = empty("PhoneRig_Ref", rig_coll)
