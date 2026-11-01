@@ -410,21 +410,29 @@ def lathe(name, prof, coll, seg=96, center=(0, 0, 0), axis=-1, closed=False, smo
         else:
             rows.append(list(range(len(verts), len(verts) + seg)))
             verts.extend(zip(cx + r * np.cos(th), cy + r * np.sin(th), np.full(seg, z)))
-    faces = []
-    pairs = list(zip(rows[:-1], rows[1:]))
+    faces, flat = [], []
+    idx = list(range(len(prof)))
+    pairs = list(zip(idx[:-1], idx[1:]))
     if closed:
-        pairs.append((rows[-1], rows[0]))
-    for ra, rb in pairs:
+        pairs.append((idx[-1], idx[0]))
+    for ka, kb in pairs:
+        ra, rb = rows[ka], rows[kb]
         if len(ra) == 1 and len(rb) == 1:
             continue
+        planar = abs(prof[ka][1] - prof[kb][1]) < 1e-9
+        n0 = len(faces)
         if len(ra) == 1:
             faces += [(ra[0], rb[i], rb[(i + 1) % seg]) for i in range(seg)]
         elif len(rb) == 1:
             faces += [(ra[i], ra[(i + 1) % seg], rb[0]) for i in range(seg)]
         else:
             faces += [(ra[i], ra[(i + 1) % seg], rb[(i + 1) % seg], rb[i]) for i in range(seg)]
+        if planar:
+            flat += range(n0, len(faces))
     ob = make_mesh(name, verts, faces, coll, smooth=smooth, sharp_angle=sharp_angle)
     fix_normals(ob)          # consistent outward normals: glass refraction depends on them
+    for i in flat:           # flat discs and rings stay flat: smooth fans would act like lenses
+        ob.data.polygons[i].use_smooth = False
     if mat is not None:
         ob.data.materials.append(mat)
     return ob
@@ -805,10 +813,20 @@ def mat_flash():
 
 
 def mat_sensor(lg):
+    """Image sensor: iridescent micro-lens grid that glows violet as the iris opens."""
     m, nb = new_material("Sensor")
     ctl = use_group(nb, lg)
+    oc = nb.sep(nb.node("ShaderNodeTexCoord").outputs["Object"])
+    x, y = nb.out(oc, "X"), nb.out(oc, "Y")
+    r = nb.math("MULTIPLY", nb.math("SQRT", nb.math("ADD", nb.math("MULTIPLY", x, x), nb.math("MULTIPLY", y, y))), 1000.0)
+    k = 2 * math.pi * 1000.0 / 0.16                       # 0.16 mm micro-lens pitch
+    grid = nb.math("MULTIPLY", nb.math("ABSOLUTE", nb.math("SINE", nb.math("MULTIPLY", x, k))),
+                   nb.math("ABSOLUTE", nb.math("SINE", nb.math("MULTIPLY", y, k))))
+    fall = nb.mapr(r, 0.0, 5.0, 1.0, 0.25)
+    col = nb.mix(nb.mapr(r, 0.5, 4.5), (0.42, 0.20, 1.0), (0.10, 0.25, 1.0))
+    amt = nb.math("MULTIPLY", nb.math("MULTIPLY", fall, nb.mapr(grid, 0.0, 1.0, 0.55, 1.0)), ctl.outputs["SensorGlow"])
     nb.output(nb.principled(base=(0.02, 0.02, 0.03), metal=1.0, rough=0.12, film=420.0, film_ior=1.6,
-                            emit=(0.30, 0.13, 1.0), emit_str=nb.math("MULTIPLY", ctl.outputs["SensorGlow"], 2.2)))
+                            emit=col, emit_str=nb.math("MULTIPLY", amt, 1.6)))
     return m
 
 
@@ -837,7 +855,7 @@ def mat_screen(sg):
     vign = nb.mapr(v, 1.0, 0.55, 0.45, 1.0)     # darker under the clock
     col = nb.mix(1.0, col, nb.comb(vign, vign, vign), blend="MULTIPLY")
     strength = nb.math("MULTIPLY", ctl.outputs["On"], 1.7)
-    nb.output(nb.principled(base=(0.0, 0.0, 0.0), rough=0.25, spec=0.2, emit=col, emit_str=strength))
+    nb.output(nb.principled(base=(0.0, 0.0, 0.0), rough=0.08, spec=0.2, emit=col, emit_str=strength))
     return m
 
 
@@ -1374,10 +1392,17 @@ def rrect(hw, hh, r, center=(0.0, 0.0), step=0.8):
     return fn
 
 
-def poly_outline(points, iters=4):
-    """Closed CCW polygon -> rounded outline fn (Chaikin corner cutting)."""
+def poly_outline(points, iters=4, corner=2.5):
+    """Closed CCW polygon -> outline fn with small rounded corners (each corner is first
+    cut back by `corner` mm along both edges, then smoothed by Chaikin iterations)."""
     def fn():
-        p = np.asarray(points, dtype=float)
+        q0 = np.asarray(points, dtype=float)
+        cut = []
+        for i in range(len(q0)):
+            a, b, c = q0[i - 1], q0[i], q0[(i + 1) % len(q0)]
+            ea, eb = (a - b) / np.linalg.norm(a - b), (c - b) / np.linalg.norm(c - b)
+            cut += [b + ea * corner, b + eb * corner]
+        p = np.asarray(cut)
         for _ in range(iters):
             q = np.roll(p, -1, axis=0)
             p = np.stack([0.75 * p + 0.25 * q, 0.25 * p + 0.75 * q], 1).reshape(-1, 2)
@@ -1492,12 +1517,12 @@ def mat_vapor(cg, chip_xy):
     dy = nb.math("SUBTRACT", nb.out(oc, "Y"), chip_xy[1] * MM)
     r = nb.math("MULTIPLY", nb.math("SQRT", nb.math("ADD", nb.math("MULTIPLY", dx, dx), nb.math("MULTIPLY", dy, dy))), 1000.0)
     wave = nb.math("SINE", nb.math("SUBTRACT", nb.math("MULTIPLY", r, 0.9), ctl.outputs["Phase"]))
-    wave = nb.math("POWER", nb.mapr(wave, 0.6, 1.0), 2.0)
-    fall = nb.math("EXPONENT", nb.math("MULTIPLY", r, -0.07))
+    wave = nb.math("POWER", nb.mapr(wave, 0.2, 1.0), 1.5)
+    fall = nb.math("EXPONENT", nb.math("MULTIPLY", r, -0.06))
     heat = nb.math("MULTIPLY", nb.math("MULTIPLY", wave, fall), ctl.outputs["Heat"])
     col = nb.ramp(heat, [(0.0, (0.0, 0.0, 0.0, 1.0)), (0.3, "#ff3b0a"), (0.7, "#ff9a3c"), (1.0, "#fff1c9")])
     nb.output(nb.principled(base="#d08055", metal=1.0, rough=0.26, emit=col,
-                            emit_str=nb.math("MULTIPLY", heat, 3.5)))
+                            emit_str=nb.math("MULTIPLY", heat, 2.0)))
     return m
 
 
@@ -1805,7 +1830,7 @@ def build_ad(scene, root, M, ph, internals):
     a, b = S["inside"]
     tgt3 = empty("Cam3_Target", coll, loc=(0, 0, 0))
     kfs(tgt3, "location", [(a, mm(0, 0, 2)), (b, mm(0, 0, 0))])
-    c3 = camera("Cam3_Inside", coll, lens=35.0, fstop=8.0)
+    c3 = camera("Cam3_Inside", coll, lens=40.0, fstop=8.0)
     c3.data.dof.focus_object = tgt3
     kfs(c3, "location", [(a, mm(-250, -330, 120)), (a + 60, mm(-300, -300, 105)), (b, mm(-270, -330, 115))])
     con = c3.constraints.new("TRACK_TO")
@@ -1863,10 +1888,10 @@ def build_ad(scene, root, M, ph, internals):
     light_on(fill, [S["reveal"], S["finish"], S["hero"]], [1.2, 1.2, 1.0])
     ik = area_light("InsideKey", lights, (-0.16, -0.34, 0.36), (0, 0, 0), 0.55, 0.0, size_y=0.40, color=(1.0, 0.97, 0.94))
     ir = area_light("InsideRim", lights, (0.26, 0.28, 0.20), (0, 0, 0), 0.30, 0.0, color=(0.9, 0.95, 1.0))
-    iu = area_light("InsideUnder", lights, (-0.05, -0.20, -0.35), (0, 0, 0), 0.50, 0.0, color=(1.0, 0.85, 0.8))
-    light_on(ik, [S["inside"]], [6.0])
-    light_on(ir, [S["inside"]], [2.0])
-    light_on(iu, [S["inside"]], [1.5])
+    iu = area_light("InsideUnder", lights, (-0.32, 0.05, -0.28), (0, 0, 0), 0.40, 0.0, color=(1.0, 0.85, 0.8))
+    light_on(ik, [S["inside"]], [7.0])
+    light_on(ir, [S["inside"]], [2.5])
+    light_on(iu, [S["inside"]], [1.0])
 
     # sweeping light bar (seen only in reflections)
     v = [(-0.012, 0, -0.45), (0.012, 0, -0.45), (0.012, 0, 0.45), (-0.012, 0, 0.45)]
