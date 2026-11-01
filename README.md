@@ -5,6 +5,10 @@
 *2560 × 1440 (1440p), Cycles, 48 samples + OpenImageDenoise, rendered with
 `python forest_scene.py --preset final`. There is no retouching outside Blender.*
 
+> **Also in this repo:** [`anime_character/`](anime_character/), a rigged, game-ready anime
+> character (all-quad topology, 24k triangles, game skeleton with IK, face shape keys, FBX + GLB),
+> also generated entirely by a Python script.
+
 **Video:** [`renders/forest_walk_10s.mp4`](renders/forest_walk_10s.mp4) is a 10-second walk
 down the footpath (960 × 540, 24 fps, H.264).
 
