@@ -177,3 +177,9 @@ your own Blender version if you use 4.x.
   environment couldn't download.
 - **Volumetrics dominate the render time.** `--no-fog` is the quickest way to iterate on
   layout.
+
+---
+
+> **Also in this repo:** [`iphone18_pro/`](iphone18_pro/), a 1:1 iPhone 18 Pro modelled from Apple's
+> dimensional drawing, plus a 24-second product ad with titles and a generated soundtrack
+> ([video](iphone18_pro/renders/iphone18pro_ad.mp4)), also generated entirely by a Python script.

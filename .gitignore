@@ -5,4 +5,6 @@ __pycache__/
 renders/*_frames/
 *.blend
 renders/*.log
-!iphone18pro_ad.blend
+!iphone18_pro/*.blend
+iphone18_pro/renders/*_frames/
+iphone18_pro/renders/*.log
