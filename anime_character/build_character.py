@@ -720,7 +720,8 @@ def build_hand(cage, side, wrist_ring, W, d_arm, shift):
     thumb_base = [r0[k_bot], r0[k_top], r1[k_top], r1[k_bot]]
     t_dir = (d * 0.78 + uf * 0.45 - uu * 0.42).normalized()
     t_center = sum((cage.co[i] for i in thumb_base), V()) / 4
-    build_digit(cage, thumb_base, t_center, t_dir, uu, (0.016, 0.026, 0.021, 0.018),
+    digits = {}
+    digits["thumb"] = build_digit(cage, thumb_base, t_center, t_dir, uu, (0.016, 0.026, 0.021, 0.018),
                 (0.0092, 0.0090), (0.0066, 0.0058), side, "thumb", curl=(6, 10, 10))
 
     # four fingers from the knuckle cap (a 4 x 1 grid)
@@ -735,9 +736,10 @@ def build_hand(cage, side, wrist_ring, W, d_arm, shift):
         center = sum((cage.co[i] for i in base), V()) / 4
         rot = Matrix.Rotation(math.radians(spread) * side, 3, uu)
         f_dir = (rot @ d).normalized()
-        build_digit(cage, base, center, f_dir, uu, (0.0,) + lens, b_hs, t_hs, side, name,
+        digits[name] = build_digit(cage, base, center, f_dir, uu, (0.0,) + lens, b_hs, t_hs, side, name,
                     curl=(6, 9, 9))
-    return {"d": d, "uf": uf, "uu": uu}
+    knuckle_c = sum((cage.co[i] for i in palm_rings[2]), V()) / 10
+    return {"d": d, "uf": uf, "uu": uu, "digits": digits, "knuckles": knuckle_c}
 
 
 def build_digit(cage, base, center, direction, up_hint, lens, base_hs, tip_hs, side, name, curl):
@@ -808,7 +810,7 @@ def build_digit(cage, base, center, direction, up_hint, lens, base_hs, tip_hs, s
         prev = ring
         rings.append(ring)
     cage.quad(*prev)          # fingertip cap
-    return rings
+    return joints
 
 
 # ---------------------------------------------------------------------------- legs
@@ -1419,6 +1421,7 @@ def add_face_details(ob, features):
         out["eyes"][side] = {"pivot": pivot, "axis": f}
         # socket wall: from the lid rim back to just inside the eyeball
         prev = rim
+        walls = []
         for t in (0.45, 1.0):
             ring = []
             for v in rim:
@@ -1430,6 +1433,8 @@ def add_face_details(ob, features):
                 fc.material_index = MAT["skin"]
                 body_faces.append(fc)
             prev = ring
+            walls.append(ring)
+        out["eyes"][side]["wall"] = walls
         # eyeball cap (a piece of a sphere around the eye pivot, UV'd for the iris texture)
         A, B = EYE_SPAN
         na, nb = 18, 14
@@ -1513,6 +1518,7 @@ def add_face_details(ob, features):
             fc = bm.faces.new([A_[k], A_[k2], B_[k2], B_[k]])
             fc.material_index = MAT["mouth"]
             body_faces.append(fc)
+    out["mouth_bag"] = rings[1:]
     last = rings[-1]
     top = last[1:nh]                              # left -> right
     bot = [last[k] for k in range(n - 1, nh, -1)]  # left -> right
@@ -1532,6 +1538,8 @@ def add_face_details(ob, features):
     for side, e in out["eyes"].items():
         e["verts"] = [v.index for v in e["verts"]]
         e["lash_verts"] = [v.index for v in e["lash_verts"]]
+        e["wall"] = [[v.index for v in r] for r in e["wall"]]
+    out["mouth_bag"] = [[v.index for v in r] for r in out["mouth_bag"]]
     bm.free()
     ob.data.shade_smooth()
     return out
@@ -1781,14 +1789,15 @@ def build_hair(body):
         path = drape(root, n, d0, L, tip_z=tip, push=push, hug_z=hug_z)
         path = resample(path, nseg)
         vs = build_lock(bm, uv, path, w, h, 0, s_layer, g_layer, HAIR_GROUPS[grp], curl)
-        locks.append((grp, psi, vs))
+        locks.append((grp, psi, path))
     bm.to_mesh(me)
     bm.free()
     ob = bpy.data.objects.new("Hair", me)
     bpy.context.scene.collection.objects.link(ob)
     me.shade_smooth()
     assign_materials(ob, ["hair"])
-    return ob
+    ob["locks"] = 0
+    return ob, locks
 
 
 # =============================================================================
@@ -1991,6 +2000,499 @@ def assign_outfit(body, parts):
         if z < 0.105 and abs(c.x) < 0.13:
             mat = "shoes"
         poly.material_index = MAT[mat]
+
+
+# =============================================================================
+#  Rig: a game skeleton with IK controls, skin weights and face shape keys
+# =============================================================================
+
+FWD = V((0, -1, 0))
+SKIRT_CHAINS = [("Front", 0), ("FrontSide", 45), ("Side", 90), ("BackSide", 135), ("Back", 180)]
+SKIRT_JOINT_Z = (0.950, 0.810, 0.665)
+
+
+def side_name(name, side):
+    return name + (".L" if side > 0 else ".R")
+
+
+def skirt_point(z, ang_deg, inset=0.0015):
+    """Point on the skirt (between its two layers) at height z and angle (0 = front, +X = 90)."""
+    rs = SKIRT_RINGS
+    for (z0, a0, f0, b0, _), (z1, a1, f1, b1, _) in zip(rs, rs[1:]):
+        if z1 <= z <= z0:
+            u = (z0 - z) / (z0 - z1)
+            a, f, b = lerp(a0, a1, u), lerp(f0, f1, u), lerp(b0, b1, u)
+            break
+    else:
+        a, f, b = rs[-1][1:4]
+    th = math.radians(ang_deg)
+    sx, cy = math.sin(th), -math.cos(th)
+    return V(((a - inset) * sx, 0.008 + ((f if cy < 0 else b) - inset) * cy, z))
+
+
+def lock_chain(path, z_start, n_bones):
+    """Joints for a bone chain that follows a hair lock from z_start down to its tip."""
+    pts = [p for p in path if p.z <= z_start]
+    if len(pts) < 2:
+        pts = path[-2:]
+    acc = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        acc.append(acc[-1] + (b - a).length)
+    joints = []
+    j = 0
+    for k in range(n_bones + 1):
+        t = acc[-1] * k / n_bones
+        while j < len(acc) - 2 and acc[j + 1] < t:
+            j += 1
+        u = (t - acc[j]) / max(acc[j + 1] - acc[j], 1e-9)
+        joints.append(pts[j].lerp(pts[j + 1], clamp(u, 0, 1)))
+    return joints
+
+
+def signed_angle(u, v, normal):
+    a = u.angle(v)
+    return -a if u.cross(v).dot(normal) > 0 else a
+
+
+def build_armature(parts, face, locks):
+    data = bpy.data.armatures.new("Armature")
+    arm = bpy.data.objects.new("Armature", data)
+    bpy.context.scene.collection.objects.link(arm)
+    data.display_type = "OCTAHEDRAL"
+    arm.show_in_front = True
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    bpy.context.view_layer.objects.active = arm
+    arm.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    eb = data.edit_bones
+    colls = {n: data.collections.new(n) for n in ("Deform", "Physics", "Controls")}
+    chains = {}
+
+    def bone(name, head, tail, parent=None, roll=FWD, deform=True, connect=False, coll="Deform"):
+        b = eb.new(name)
+        b.head, b.tail = V(head), V(tail)
+        b.align_roll(V(roll))
+        if parent:
+            b.parent = eb[parent]
+            b.use_connect = connect
+        b.use_deform = deform
+        colls[coll].assign(b)
+        return b
+
+    bone("Root", (0, 0, 0), (0, 0, 0.15))
+    bone("Hips", (0, 0.012, 0.880), (0, 0.008, 0.970), "Root")
+    bone("Spine", (0, 0.008, 0.970), (0, 0.004, 1.060), "Hips", connect=True)
+    bone("Chest", (0, 0.004, 1.060), (0, 0.002, 1.150), "Spine", connect=True)
+    bone("UpperChest", (0, 0.002, 1.150), (0, 0.012, 1.310), "Chest", connect=True)
+    bone("Neck", (0, 0.012, 1.310), (0, 0.016, 1.395), "UpperChest", connect=True)
+    bone("Head", (0, 0.016, 1.395), (0, 0.016, 1.585), "Neck", connect=True)
+    for side, e in face["eyes"].items():
+        bone(side_name("Eye", side), e["pivot"], e["pivot"] + e["axis"] * 0.03, "Head", roll=(0, 0, 1))
+    for side in (-1, 1):
+        a = parts["arms"][side]
+        h = a["hand"]
+        S, E, W = a["S"], a["E"], a["W"]
+        bone(side_name("Shoulder", side), (side * 0.018, -0.004, 1.292), S, "UpperChest")
+        bone(side_name("UpperArm", side), S, E, side_name("Shoulder", side), connect=True)
+        bone(side_name("LowerArm", side), E, W, side_name("UpperArm", side), connect=True)
+        bone(side_name("Hand", side), W, h["knuckles"], side_name("LowerArm", side), roll=h["uu"], connect=True)
+        for name, j in h["digits"].items():
+            nm = name.capitalize()
+            segs = [(j[0], j[2]), (j[2], j[3]), (j[3], j[4])]
+            prev = side_name("Hand", side)
+            for k, (p0, p1) in enumerate(segs):
+                bn = side_name("%s_%d" % (nm, k + 1), side)
+                bone(bn, p0, p1, prev, roll=h["uu"], connect=k > 0)
+                prev = bn
+        hip = V((side * HIP.x, HIP.y, HIP.z))
+        knee = V((side * KNEE.x, KNEE.y, KNEE.z))
+        ankle = V((side * ANKLE.x, ANKLE.y, ANKLE.z))
+        ball = V((side * (ANKLE.x + 0.008), -0.092, 0.022))
+        toe = V((side * (ANKLE.x + 0.012), -0.160, 0.020))
+        bone(side_name("UpperLeg", side), hip, knee, "Hips")
+        bone(side_name("LowerLeg", side), knee, ankle, side_name("UpperLeg", side), connect=True)
+        bone(side_name("Foot", side), ankle, ball, side_name("LowerLeg", side), roll=(0, 0, 1), connect=True)
+        bone(side_name("Toes", side), ball, toe, side_name("Foot", side), roll=(0, 0, 1), connect=True)
+        # IK controls (not exported: use_deform is off)
+        bone(side_name("IK_Foot", side), ankle, ball, "Root", roll=(0, 0, 1), deform=False, coll="Controls")
+        bone(side_name("Pole_Knee", side), knee + V((0, -0.40, 0)), knee + V((0, -0.45, 0)), "Root",
+             deform=False, coll="Controls")
+        bone(side_name("IK_Hand", side), W, h["knuckles"], "Root", roll=h["uu"], deform=False, coll="Controls")
+        bone(side_name("Pole_Elbow", side), E + V((0, 0.35, 0)), E + V((0, 0.40, 0)), "Root",
+             deform=False, coll="Controls")
+    # hair chains (spring-bone / physics friendly)
+    face_lock = {1: None, -1: None}
+    back = {}
+    for grp, psi, path in locks:
+        if grp in ("side_L", "side_R") and abs(psi) == 76:
+            face_lock[1 if psi > 0 else -1] = path
+        if grp == "back" and abs(psi) in (122, 146, 180) and path[-1].z < 1.15:
+            back[psi] = path
+    for side, path in face_lock.items():
+        js = lock_chain(path, 1.47, 3)
+        names = [side_name("HairSide_%d" % (k + 1), side) for k in range(3)]
+        prev = "Head"
+        for k in range(3):
+            bone(names[k], js[k], js[k + 1], prev, roll=FWD, connect=k > 0, coll="Physics")
+            prev = names[k]
+        chains[side_name("HairSide", side)] = (js, names, "Head")
+    labels = {180: "C", 146: "In", 122: "Out"}
+    for psi, path in sorted(back.items()):
+        js = lock_chain(path, 1.43, 4)
+        side = 0 if psi == 180 else (1 if psi > 0 else -1)
+        base = "HairBack_%s" % labels[abs(psi)]
+        names = [(base + "_%d" % (k + 1)) + ("" if side == 0 else (".L" if side > 0 else ".R")) for k in range(4)]
+        prev = "Head"
+        for k in range(4):
+            bone(names[k], js[k], js[k + 1], prev, roll=(0, 1, 0), connect=k > 0, coll="Physics")
+            prev = names[k]
+        chains[base + str(side)] = (js, names, "Head")
+    # skirt chains
+    for label, ang in SKIRT_CHAINS:
+        for side in ((1,) if ang in (0, 180) else (1, -1)):
+            a = ang * side
+            js = [skirt_point(z, a) for z in SKIRT_JOINT_Z]
+            suffix = "" if ang in (0, 180) else (".L" if side > 0 else ".R")
+            names = ["Skirt_%s_%d%s" % (label, k + 1, suffix) for k in range(2)]
+            bone(names[0], js[0], js[1], "Hips", roll=(0, 0, 1) if ang == 90 else FWD, coll="Physics")
+            bone(names[1], js[1], js[2], names[0], roll=(0, 0, 1) if ang == 90 else FWD, connect=True,
+                 coll="Physics")
+            chains["Skirt%d" % a] = (js, names, "Hips")
+    # pole angles need edit-bone axes
+    poles = {}
+    for side in (-1, 1):
+        for up, lo, pole in (("UpperLeg", "LowerLeg", "Pole_Knee"), ("UpperArm", "LowerArm", "Pole_Elbow")):
+            b0, b1, pb = eb[side_name(up, side)], eb[side_name(lo, side)], eb[side_name(pole, side)]
+            normal = (b1.tail - b0.head).cross(pb.head - b0.head)
+            proj = normal.cross(b0.tail - b0.head)
+            poles[side_name(lo, side)] = signed_angle(b0.x_axis, proj, b0.tail - b0.head)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # IK constraints with IK/FK switches (custom properties on the armature object)
+    for side in (-1, 1):
+        for limb, lo, end, tgt, pole, default in (("Leg", "LowerLeg", "Foot", "IK_Foot", "Pole_Knee", 1.0),
+                                                  ("Arm", "LowerArm", "Hand", "IK_Hand", "Pole_Elbow", 0.0)):
+            prop = side_name("IK_" + limb, side)
+            arm[prop] = default
+            arm.id_properties_ui(prop).update(min=0.0, max=1.0, description="0 = FK, 1 = IK")
+            pb = arm.pose.bones[side_name(lo, side)]
+            c = pb.constraints.new("IK")
+            c.target, c.subtarget = arm, side_name(tgt, side)
+            c.pole_target, c.pole_subtarget = arm, side_name(pole, side)
+            c.pole_angle = poles[side_name(lo, side)]
+            c.chain_count = 2
+            cr = arm.pose.bones[side_name(end, side)].constraints.new("COPY_ROTATION")
+            cr.target, cr.subtarget = arm, side_name(tgt, side)
+            for con in (c, cr):
+                fc = con.driver_add("influence")
+                fc.driver.type = "AVERAGE"
+                var = fc.driver.variables.new()
+                var.type = "SINGLE_PROP"
+                var.targets[0].id = arm
+                var.targets[0].data_path = '["%s"]' % prop
+    for b in data.bones:
+        if b.name.startswith(("Hair", "Skirt")):
+            data.bones[b.name].color.palette = "THEME04"
+        elif not b.use_deform:
+            data.bones[b.name].color.palette = "THEME09"
+    return arm, chains
+
+
+# ---------------------------------------------------------------------------- weights
+def chain_param(p, joints):
+    best_d, best_t = 1e9, 0.0
+    n = len(joints) - 1
+    for i in range(n):
+        a, b = joints[i], joints[i + 1]
+        ab = b - a
+        u = (p - a).dot(ab) / ab.length_squared
+        uc = clamp(u, 0.0, 1.0)
+        d = (p - (a + ab * uc)).length
+        if d < best_d:
+            best_d = d
+            best_t = i + (u if (i == 0 and u < 0) or (i == n - 1 and u > 1) else uc)
+    return best_d, best_t
+
+
+def hat_weights(t, names, parent, out, scale=1.0):
+    centers = [(-0.5, parent)] + [(i + 0.5, n) for i, n in enumerate(names)]
+    t = clamp(t, -0.5, len(names) - 0.5)
+    for c, n in centers:
+        x = 1.0 - abs(t - c)
+        if x > 0:
+            out[n] = out.get(n, 0.0) + x * scale
+    return out
+
+
+def set_weights(ob, weights_per_vertex):
+    """weights_per_vertex: {vertex index: {group: weight}} (replaces existing weights)."""
+    groups = {g.name: g for g in ob.vertex_groups}
+    for i, wd in weights_per_vertex.items():
+        for g in ob.vertex_groups:
+            g.remove([i])
+        tot = sum(wd.values()) or 1.0
+        for name, w in wd.items():
+            if name not in groups:
+                groups[name] = ob.vertex_groups.new(name=name)
+            groups[name].add([i], w / tot, "REPLACE")
+
+
+def clean_weights(ob, limit=4):
+    with bpy.context.temp_override(object=ob, active_object=ob, selected_objects=[ob],
+                                   selected_editable_objects=[ob]):
+        bpy.ops.object.vertex_group_clean(group_select_mode="ALL", limit=0.01)
+        bpy.ops.object.vertex_group_limit_total(group_select_mode="ALL", limit=limit)
+        bpy.ops.object.vertex_group_normalize_all(group_select_mode="ALL", lock_active=False)
+
+
+def bind(ob, arm):
+    ob.parent = arm
+    mod = ob.modifiers.new("Armature", "ARMATURE")
+    mod.object = arm
+
+
+def weight_body(body, arm, face):
+    helper = [g.name for g in body.vertex_groups]
+    skip = ("Root", "Eye", "Hair", "Skirt")
+    saved = {}
+    for b in arm.data.bones:
+        saved[b.name] = b.use_deform
+        if b.name.startswith(skip):
+            b.use_deform = False
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    body.select_set(True)
+    arm.select_set(True)
+    bpy.context.view_layer.objects.active = arm
+    bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+    for name, val in saved.items():
+        arm.data.bones[name].use_deform = val
+    for g in [body.vertex_groups[n] for n in helper]:
+        g.lock_weight = False
+    # eyes, lashes, brows, eye sockets and the mouth bag: rigid
+    me = body.data
+    fixed = {}
+    for side, e in face["eyes"].items():
+        for i in e["verts"]:
+            fixed[i] = {side_name("Eye", side): 1.0}
+        for i in e["lash_verts"]:
+            fixed[i] = {"Head": 1.0}
+        for ring in e["wall"]:
+            for i in ring:
+                fixed[i] = {"Head": 1.0}
+    for ring in face["mouth_bag"]:
+        for i in ring:
+            fixed[i] = {"Head": 1.0}
+    hg = body.vertex_groups["head"].index
+    for v in me.vertices:
+        if v.index not in fixed and any(g.group == hg and g.weight > 0.999 for g in v.groups):
+            fixed[v.index] = {"Head": 1.0}
+    set_weights(body, fixed)
+    # the construction groups are not bones: move them out of the way
+    for n in helper:
+        body.vertex_groups.remove(body.vertex_groups[n])
+    clean_weights(body)
+    body.modifiers[-1].name = "Armature"
+
+
+def weight_hair(hair, arm, chains):
+    me = hair.data
+    s_attr = me.attributes["hair_s"].data
+    g_attr = me.attributes["hair_group"].data
+    back = [c for k, c in chains.items() if k.startswith("HairBack")]
+    W = {}
+    for v in me.vertices:
+        g = g_attr[v.index].value
+        p = v.co
+        if g in (HAIR_GROUPS["side_L"], HAIR_GROUPS["side_R"]):
+            js, names, parent = chains["HairSide.L" if g == HAIR_GROUPS["side_L"] else "HairSide.R"]
+            W[v.index] = hat_weights(chain_param(p, js)[1], names, parent, {})
+        elif g == HAIR_GROUPS["back"]:
+            ds = sorted((chain_param(p, js)[0], chain_param(p, js)[1], names, parent) for js, names, parent in back)
+            (da, ta, na, pa), (db, tb, nb, pb) = ds[0], ds[1]
+            wa = db / (da + db + 1e-9)
+            wd = hat_weights(ta, na, pa, {}, wa)
+            hat_weights(tb, nb, pb, wd, 1.0 - wa)
+            W[v.index] = wd
+        else:
+            W[v.index] = {"Head": 1.0}
+    set_weights(hair, W)
+    clean_weights(hair)
+    bind(hair, arm)
+
+
+def weight_skirt(skirt, arm, chains):
+    W = {}
+    angs = sorted(int(k[5:]) for k in chains if k.startswith("Skirt"))
+    for v in skirt.data.vertices:
+        p = v.co
+        a = math.degrees(math.atan2(p.x, -(p.y - 0.008)))
+        # two neighbouring chains around the body
+        best = sorted(angs, key=lambda c: abs(angle_wrap(math.radians(a - c))))[:2]
+        d0 = abs(math.degrees(angle_wrap(math.radians(a - best[0]))))
+        d1 = abs(math.degrees(angle_wrap(math.radians(a - best[1]))))
+        w0 = d1 / (d0 + d1 + 1e-9)
+        z0, z1, z2 = SKIRT_JOINT_Z
+        t = (z0 - p.z) / (z0 - z1) if p.z >= z1 else 1.0 + (z1 - p.z) / (z1 - z2)
+        wd = {}
+        # a little thigh influence keeps the skirt out of a raised leg without cloth physics
+        leg = 0.35 * smoothstep(0.93, 0.78, p.z) * clamp(abs(p.x) / 0.10, 0.0, 1.0) * clamp(-(p.y - 0.06) / 0.10, 0.0, 1.0)
+        for c, w in ((best[0], w0), (best[1], 1.0 - w0)):
+            js, names, parent = chains["Skirt%d" % c]
+            hat_weights(t, names, parent, wd, w * (1.0 - leg))
+        if leg > 0:
+            wd[side_name("UpperLeg", 1 if p.x > 0 else -1)] = leg
+        W[v.index] = wd
+    set_weights(skirt, W)
+    clean_weights(skirt)
+    bind(skirt, arm)
+
+
+def weight_from_body(ob, body, arm, rigid=None):
+    """Copy skin weights from the nearest body vertex (clothes that hug the body)."""
+    me = body.data
+    kd = KDTree(len(me.vertices))
+    for v in me.vertices:
+        kd.insert(v.co, v.index)
+    kd.balance()
+    names = {g.index: g.name for g in body.vertex_groups}
+    W = {}
+    for v in ob.data.vertices:
+        if rigid and rigid(v):
+            W[v.index] = dict(rigid(v))
+            continue
+        acc = {}
+        for co, j, d in kd.find_n(v.co, 3):
+            wgt = 1.0 / (d + 1e-4)
+            for g in me.vertices[j].groups:
+                acc[names[g.group]] = acc.get(names[g.group], 0.0) + g.weight * wgt
+        W[v.index] = acc
+    set_weights(ob, W)
+    clean_weights(ob)
+    bind(ob, arm)
+
+
+# ---------------------------------------------------------------------------- shape keys
+JAW_PIVOT = V((0.0, 0.035, 1.430))
+
+
+def add_shape_keys(body, features, face):
+    me = body.data
+    body.shape_key_add(name="Basis", from_mix=False)
+    co = [v.co.copy() for v in me.vertices]
+
+    def key(name, deltas):
+        k = body.shape_key_add(name=name, from_mix=False)
+        for i, d in deltas.items():
+            k.data[i].co = co[i] + d
+        return k
+
+    # ---- blinks: the upper lid closes down onto a line just above the lower lid
+    blink = {}
+    for side, layers in features["eye"].items():
+        n = len(layers[0])
+        nh = n // 2
+        e = face["eyes"][side]
+        rim_delta = {}
+        for k in range(1, nh):
+            top, bot = layers[0][k], layers[0][n - k]
+            dz = co[bot] - co[top]
+            for L, f in zip(layers, (1.0, 0.93, 0.62, 0.25)):
+                blink.setdefault(side, {})[L[k]] = dz * 0.86 * f
+            for L, f in zip(layers, (1.0, 0.8, 0.4, 0.1)):
+                blink[side][L[n - k]] = -dz * 0.14 * f
+            rim_delta[top] = dz * 0.86
+            rim_delta[bot] = -dz * 0.14
+        for ring in e["wall"]:
+            for k in range(1, n):
+                blink[side][ring[k]] = blink[side].get(layers[0][k], V())
+        rim = layers[0]
+        for i in e["lash_verts"]:
+            j = min(rim, key=lambda r: (co[r] - co[i]).length_squared)
+            blink[side][i] = rim_delta.get(j, V())
+    key("Blink_L", blink[1])
+    key("Blink_R", blink[-1])
+    both = dict(blink[1])
+    both.update(blink[-1])
+    key("Blink", both)
+
+    # ---- mouth: jaw rotation + lip shaping
+    mouth = features["mouth"]
+    n = len(mouth[0])
+    nh = n // 2
+    lower, corner = set(), set()
+    for L in mouth[:4]:
+        lower.update(L[k] for k in range(nh + 1, n))
+        corner.update((L[0], L[nh]))
+    for ring in face["mouth_bag"]:
+        lower.update(ring[k] for k in range(nh + 1, n))
+        corner.update((ring[0], ring[nh]))
+    upper_set = set()
+    for L in mouth[:4]:
+        upper_set.update(L[k] for k in range(1, nh))
+    for ring in face["mouth_bag"]:
+        upper_set.update(ring[k] for k in range(1, nh))
+    head_skin = set()
+    eye_like = set()
+    for e in face["eyes"].values():
+        eye_like.update(e["verts"])
+        eye_like.update(e["lash_verts"])
+    zm = MOUTH_C.z
+    for v in me.vertices:
+        p = co[v.index]
+        if p.z > 1.33 and p.z < 1.47 and abs(p.x) < 0.085 and v.index not in eye_like:
+            head_skin.add(v.index)
+
+    def jaw_w(i):
+        if i in lower:
+            return 1.0
+        if i in corner:
+            return 0.5
+        if i in upper_set:
+            return 0.0
+        p = co[i]
+        if p.y > 0.02 or p.z < 1.352:
+            return 0.0
+        wz = smoothstep(zm + 0.003, zm - 0.010, p.z)
+        wx = 1.0 - smoothstep(0.032, 0.070, abs(p.x))
+        wy = 1.0 - smoothstep(-0.02, 0.02, p.y)
+        return wz * wx * wy
+
+    def mouth_w(i):
+        p = co[i]
+        d = math.hypot(p.x, (p.z - zm) * 1.3)
+        return (1.0 - smoothstep(0.010, 0.026, d)) * (1.0 - smoothstep(-0.045, -0.035, p.y))
+
+    def shape(jaw_deg, sx=1.0, fwd=0.0, corners_up=0.0):
+        R = Matrix.Rotation(math.radians(jaw_deg), 3, "X")
+        out = {}
+        for i in head_skin:
+            p = co[i]
+            d = V()
+            w = jaw_w(i)
+            if w > 0:
+                d += ((R @ (p - JAW_PIVOT)) + JAW_PIVOT - p) * w
+            m = mouth_w(i)
+            if m > 0:
+                d.x += (sx - 1.0) * p.x * m
+                d.y -= fwd * m
+            if corners_up:
+                for cx in (-MOUTH_HALF_W, MOUTH_HALF_W):
+                    dc = math.hypot(p.x - cx, (p.z - zm) * 1.2)
+                    wc = (1.0 - smoothstep(0.003, 0.018, dc)) * (1.0 - smoothstep(-0.045, -0.035, p.y))
+                    d.z += corners_up * wc
+                    d.x += math.copysign(corners_up * 0.4, cx) * wc
+            if d.length_squared > 0:
+                out[i] = d
+        return out
+
+    key("Mouth_A", shape(6.0, 1.04))
+    key("Mouth_I", shape(2.0, 1.16, corners_up=0.0006))
+    key("Mouth_U", shape(2.5, 0.72, fwd=0.0016))
+    key("Mouth_E", shape(4.5, 1.10))
+    key("Mouth_O", shape(6.0, 0.80, fwd=0.0010))
+    key("Smile", shape(0.0, 1.04, corners_up=0.0022))
 
 
 # =============================================================================
@@ -2215,13 +2717,20 @@ def main():
     assign_materials(body, sorted(MAT, key=MAT.get))
     body.data.uv_layers.new(name="UVMap")
     face = add_face_details(body, features)
-    hair = build_hair(body)
+    hair, locks = build_hair(body)
     report_mesh(hair)
     skirt = build_skirt()
     report_mesh(skirt)
     assign_outfit(body, parts)
     collar = build_collar(body)
     report_mesh(collar)
+    arm, chains = build_armature(parts, face, locks)
+    add_shape_keys(body, features, face)
+    weight_body(body, arm, face)
+    weight_hair(hair, arm, chains)
+    weight_skirt(skirt, arm, chains)
+    bow = {i for p in collar.data.polygons if p.material_index == 2 for i in p.vertices}
+    weight_from_body(collar, body, arm, rigid=lambda v: {"UpperChest": 1.0} if v.index in bow else None)
     if args.save:
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(args.save), compress=True)
         print("saved", args.save)
