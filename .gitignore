@@ -4,3 +4,5 @@ __pycache__/
 *.exr
 renders/*_frames/
 *.blend
+renders/*.log
+!iphone18pro_ad.blend
