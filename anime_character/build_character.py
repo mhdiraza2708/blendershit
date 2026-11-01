@@ -298,6 +298,18 @@ HEAD_BB = Profile([(1.585, 0.50), (1.40, 0.50), (1.34, 0.50)])
 
 
 def sd_head_loft(p):
+    # above the brow the loft is exactly the cranium ellipsoid, whose distance estimate is
+    # much better (hair and the hair cap are offset from the scalp by distance)
+    z = p.z
+    if z >= 1.50:
+        return sd_ellipsoid(p, CRANIUM_C, CRANIUM_R)
+    d = _sd_head_loft(p)
+    if z > 1.475:
+        return lerp(d, sd_ellipsoid(p, CRANIUM_C, CRANIUM_R), smoothstep(1.475, 1.50, z))
+    return d
+
+
+def _sd_head_loft(p):
     z = p.z
     if z >= HEAD_TOP:
         return z - HEAD_TOP + abs(p.x) + 0.0
@@ -1526,6 +1538,462 @@ def add_face_details(ob, features):
 
 
 # =============================================================================
+#  Hair: a scalp cap (copied from the head's own quads) + swept ribbon locks
+# =============================================================================
+
+def cap_offset(p):
+    """How far the hair surface sits above the scalp (more volume on top and at the back)."""
+    return 0.004 + 0.010 * smoothstep(1.44, 1.585, p.z) + 0.004 * smoothstep(0.0, 0.09, p.y)
+
+
+def hairline_z(psi):
+    """Lowest scalp height covered by the cap, by angle around the head (0 = front, 180 = back)."""
+    keys = [(0, 1.522), (40, 1.515), (70, 1.488), (90, 1.474), (104, 1.452), (118, 1.425),
+            (145, 1.398), (180, 1.390)]
+    a = abs(psi)
+    for (a0, z0), (a1, z1) in zip(keys, keys[1:]):
+        if a <= a1:
+            return lerp(z0, z1, smoothstep(0.0, 1.0, (a - a0) / (a1 - a0)))
+    return keys[-1][1]
+
+
+def head_psi(p):
+    return math.degrees(math.atan2(p.x, -(p.y - 0.02)))
+
+
+def body_collider(p):
+    d = sd_capsule(p, (0.0, 0.022, 1.28), (0.0, 0.015, 1.42), 0.040)                 # neck
+    d = min(d, sd_ellipsoid(p, (0.0, 0.006, 1.16), (0.135, 0.090, 0.17)))            # chest / back
+    d = min(d, sd_capsule(p, (-0.15, 0.006, 1.285), (0.15, 0.006, 1.285), 0.048))     # shoulders
+    return d
+
+
+def hair_collider(p):
+    """Negative inside the space the hair may not enter (head + cap volume + upper body)."""
+    return min(head_proj_sdf(p) - cap_offset(p) - 0.0015, body_collider(p) - 0.006)
+
+
+def scalp_point(psi_deg, elev_deg, extra=0.0):
+    ps, el = math.radians(psi_deg), math.radians(elev_deg)
+    d = V((math.sin(ps) * math.cos(el), -math.cos(ps) * math.cos(el), math.sin(el)))
+    p = project_ray(HEAD_C, d, head_proj_sdf)
+    n = sdf_normal(p, head_proj_sdf)
+    return p + n * (cap_offset(p) + extra), n
+
+
+def drape(root, n_root, d0, length, tip_z=None, step=0.004, hug=0.25, push=None, hug_z=1.40):
+    """Grow a lock from root: start tangent to the scalp along d0, fall under gravity,
+    hug the head while above the jaw, and slide over the head/body colliders."""
+    d = ortho(d0, n_root)
+    p = root.copy()
+    pts = [root - n_root * 0.007, root.copy()]      # bury the base in the cap
+    travelled = 0.0
+    while travelled < length:
+        d = d + V((0, 0, -1)) * (0.10 + 0.25 * smoothstep(0.0, 0.08, travelled))
+        if push is not None:
+            d = d + push * 0.12
+        c0 = hair_collider(p)
+        if p.z > hug_z and c0 > 0.0015:
+            d = d - sdf_normal(p, hair_collider) * hug * min(c0 / 0.01, 1.0)
+        d = d.normalized()
+        q = p + d * step
+        c = hair_collider(q)
+        if c < 0:
+            q = q - sdf_normal(q, hair_collider) * c
+        d = (q - p).normalized()
+        p = q
+        pts.append(p.copy())
+        travelled += step
+        if tip_z is not None and p.z <= tip_z:
+            break
+    return pts
+
+
+def resample(pts, n):
+    acc = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        acc.append(acc[-1] + (b - a).length)
+    L = acc[-1]
+    out = []
+    j = 0
+    for k in range(n + 1):
+        t = L * (k / n) ** 0.9            # a little denser toward the tip
+        while j < len(acc) - 2 and acc[j + 1] < t:
+            j += 1
+        seg = max(acc[j + 1] - acc[j], 1e-9)
+        out.append(pts[j].lerp(pts[j + 1], clamp((t - acc[j]) / seg, 0.0, 1.0)))
+    return out
+
+
+LOCK_SECTION = [(1.0, 0.0), (0.45, 1.0), (-0.45, 1.0), (-1.0, 0.0), (-0.45, -0.55), (0.45, -0.55)]
+
+
+def build_lock(bm, uv, path, w0, h0, mat, s_layer, g_layer, group, curl=0.0, taper=True):
+    """A tapered ribbon with a lens-shaped 6-sided section; returns its vertices."""
+    n = len(path) - 1
+    rings = []
+    prev_n = None
+    for k, p in enumerate(path):
+        s = k / n
+        t = (path[min(k + 1, n)] - path[max(k - 1, 0)]).normalized()
+        # rotation-minimising frame: carry the previous normal along, and only lean toward
+        # the collider's surface normal while the lock lies on the head (no twisting)
+        g = sdf_normal(p, hair_collider)
+        if prev_n is None:
+            nn = g
+        else:
+            near = 1.0 - smoothstep(0.004, 0.015, hair_collider(p))
+            nn = prev_n.lerp(g, 0.35 * near) if g.dot(prev_n) > 0 else prev_n
+        nn = ortho(nn, t)
+        prev_n = nn
+        sd = t.cross(nn).normalized()
+        if taper:
+            w = w0 * (0.80 + 0.40 * math.sin(math.pi * min(s * 1.25, 1.0))) * (1.0 - s) ** 0.55 + 0.0004
+            h = h0 * (1.0 - 0.7 * s) + 0.0003
+        else:
+            w, h = w0, h0
+        ring = []
+        for (a, b) in LOCK_SECTION:
+            q = p + sd * (a * w) + nn * (b * h + curl * s * s * w * (1 - abs(a)))
+            v = bm.verts.new(q)
+            if s_layer is not None:
+                v[s_layer] = s
+                v[g_layer] = group
+            ring.append(v)
+        rings.append(ring)
+    m = len(LOCK_SECTION)
+    for k in range(n):
+        for j in range(m):
+            j2 = (j + 1) % m
+            f = bm.faces.new([rings[k][j], rings[k][j2], rings[k + 1][j2], rings[k + 1][j]])
+            f.material_index = mat
+            for loop, (uu, vv) in zip(f.loops, ((j / m, k / n), (j2 / m if j2 else 1.0, k / n),
+                                                (j2 / m if j2 else 1.0, (k + 1) / n), (j / m, (k + 1) / n))):
+                loop[uv].uv = (uu, vv)
+    for ring in (rings[0], rings[-1]):        # close both ends with two quads
+        for quad in ((ring[0], ring[1], ring[2], ring[3]), (ring[3], ring[4], ring[5], ring[0])):
+            f = bm.faces.new(quad)
+            f.material_index = mat
+    return [v for r in rings for v in r]
+
+
+# lock recipes: (group, psi, elev, d0, tip_z, max_len, width, thickness, segments, curl)
+def hair_recipes():
+    R = []
+    # bangs across the forehead
+    for k, psi in enumerate([-52, -38, -25, -12, 0, 12, 25, 38, 52]):
+        tip = {0: 1.481, 12: 1.478, 25: 1.476, 38: 1.468, 52: 1.452}[abs(psi)]
+        sgn = 1 if psi > 0 else -1 if psi < 0 else 0
+        d0 = V((0.25 * sgn + math.sin(math.radians(psi)) * 0.4, -1.0, -0.15))
+        R.append(("bangs", psi, 64, d0, tip, 0.16, 0.0165 if abs(psi) < 45 else 0.0175, 0.0036, 10, -0.15))
+    # face-framing side locks, in front of the ears
+    for sgn in (-1, 1):
+        R.append(("side_" + ("L" if sgn > 0 else "R"), sgn * 76, 42, V((sgn * 0.15, -0.35, -1.0)),
+                  1.285, 0.30, 0.0175, 0.0045, 16, 0.3))
+        for psi, el, tip in ((100, 46, 1.235), (116, 42, 1.200)):
+            R.append(("side_" + ("L" if sgn > 0 else "R"), sgn * psi, el, V((sgn * 0.25, 0.25, -1.0)),
+                      tip, 0.38, 0.0215, 0.0055, 16, 0.2))
+    # long back hair: two staggered rows from the crown, falling to the mid back
+    for k, psi in enumerate((122, 134, 146, 158, 169, 180)):
+        el = 58 if k % 2 == 0 else 44
+        tip = 1.12 - 0.012 * k
+        for sgn in ((1,) if psi == 180 else (-1, 1)):
+            R.append(("back", sgn * psi, el, V((sgn * 0.2 * (psi != 180), 1.0, -0.5)),
+                      tip, 0.66, 0.0290, 0.0062, 18, 0.25))
+    for psi in (-163, -140, 140, 163):
+        R.append(("back", psi, 68, V((0.0, 1.0, -0.4)), 1.14, 0.62, 0.0270, 0.0060, 18, 0.25))
+    return R
+
+
+HAIR_GROUPS = {"cap": 0, "bangs": 1, "top": 2, "side_L": 3, "side_R": 4, "back": 5}
+
+
+def build_hair(body):
+    me = bpy.data.meshes.new("Hair")
+    bm = bmesh.new()
+    uv = bm.loops.layers.uv.verify()
+    s_layer = bm.verts.layers.float.new("hair_s")
+    g_layer = bm.verts.layers.int.new("hair_group")
+    # ---- the cap: the scalp quads of the head, lifted off the skin
+    src = bmesh.new()
+    src.from_mesh(body.data)
+    dl = src.verts.layers.deform.verify()
+    gi = {g.name: g.index for g in body.vertex_groups}
+    hidx, eidx = gi["head"], gi.get("ear")
+
+    def is_scalp(v):
+        if v[dl].get(hidx, 0.0) < 0.999 or (eidx is not None and v[dl].get(eidx, 0.0) > 0.0):
+            return False
+        return v.co.z > hairline_z(head_psi(v.co)) - 0.004
+
+    faces = [f for f in src.faces if f.material_index == MAT["skin"] and all(is_scalp(v) for v in f.verts)]
+    vmap = {}
+    for f in faces:
+        for v in f.verts:
+            if v.index not in vmap:
+                n = sdf_normal(v.co, head_proj_sdf)
+                nv = bm.verts.new(v.co + n * cap_offset(v.co))
+                nv[s_layer] = 0.0
+                nv[g_layer] = HAIR_GROUPS["cap"]
+                vmap[v.index] = nv
+    for f in faces:
+        nf = bm.faces.new([vmap[v.index] for v in f.verts])
+        nf.material_index = 0
+    src.free()
+    # a thickness band around the cap's edge, tucked down to the skin
+    edge_loops = []
+    bnd = {e for e in bm.edges if e.is_boundary}
+    while bnd:
+        e = bnd.pop()
+        start, cur, prev_e = e.verts[0], e.verts[1], e
+        loop = [start]
+        while cur is not start:
+            loop.append(cur)
+            nxt = next(x for x in cur.link_edges if x.is_boundary and x is not prev_e)
+            bnd.discard(nxt)
+            prev_e, cur = nxt, nxt.other_vert(cur)
+        edge_loops.append(loop)
+    for loop in edge_loops:                      # smooth the staircase border of the cap
+        for _ in range(6):
+            new = [(loop[k - 1].co + loop[k].co * 2 + loop[(k + 1) % len(loop)].co) / 4 for k in range(len(loop))]
+            for v, q in zip(loop, new):
+                base = project_ray(HEAD_C, q - HEAD_C, head_proj_sdf, fallback=q)
+                v.co = base + sdf_normal(base, head_proj_sdf) * cap_offset(base)
+    for loop in edge_loops:
+        inner = []
+        for v in loop:
+            n = sdf_normal(v.co, head_proj_sdf)
+            iv = bm.verts.new(v.co - n * (cap_offset(v.co) - 0.0008))
+            iv[g_layer] = HAIR_GROUPS["cap"]
+            inner.append(iv)
+        for k in range(len(loop)):
+            k2 = (k + 1) % len(loop)
+            bm.faces.new([loop[k], loop[k2], inner[k2], inner[k]])
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    # ---- locks
+    locks = []
+    for (grp, psi, el, d0, tip, L, w, h, nseg, curl) in hair_recipes():
+        root, n = scalp_point(psi, el, extra=0.0018)
+        push, hug_z = None, 1.40
+        if grp == "back":       # fall free behind the shoulders, spreading a little
+            push = V((math.sin(math.radians(psi)) * 0.35, 0.45, 0.0))
+            hug_z = 1.47
+        path = drape(root, n, d0, L, tip_z=tip, push=push, hug_z=hug_z)
+        path = resample(path, nseg)
+        vs = build_lock(bm, uv, path, w, h, 0, s_layer, g_layer, HAIR_GROUPS[grp], curl)
+        locks.append((grp, psi, vs))
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new("Hair", me)
+    bpy.context.scene.collection.objects.link(ob)
+    me.shade_smooth()
+    assign_materials(ob, ["hair"])
+    return ob
+
+
+# =============================================================================
+#  Pleated skirt and outfit zones
+# =============================================================================
+
+SKIRT_PLEATS = 24
+SKIRT_RINGS = [
+    # (z, half width, front, back, pleat depth)   waistband -> hem
+    (1.012, 0.110, 0.080, 0.078, 0.000),
+    (0.985, 0.114, 0.083, 0.082, 0.000),
+    (0.930, 0.137, 0.088, 0.098, 0.004),
+    (0.860, 0.156, 0.097, 0.120, 0.007),
+    (0.790, 0.170, 0.110, 0.133, 0.010),
+    (0.725, 0.183, 0.122, 0.145, 0.012),
+    (0.668, 0.194, 0.132, 0.156, 0.013),
+]
+
+
+def skirt_ring(z, a, f, b, depth, inset=0.0):
+    pts = []
+    n = 2 * SKIRT_PLEATS
+    for k in range(n):
+        th = 2 * math.pi * k / n - math.pi / 2          # k = 0 at the front centre
+        c, s_ = math.cos(th), math.sin(th)
+        r = 1.0 + (depth if k % 2 == 0 else -depth) / max(a, f)
+        x = (a - inset) * c * r
+        y = 0.008 + (f if s_ < 0 else b) * s_ * r - inset * s_
+        pts.append(V((x, y, z)))
+    return pts
+
+
+def build_skirt():
+    me = bpy.data.meshes.new("Skirt")
+    bm = bmesh.new()
+    uv = bm.loops.layers.uv.verify()
+    n = 2 * SKIRT_PLEATS
+    outer = [[bm.verts.new(p) for p in skirt_ring(*r)] for r in SKIRT_RINGS]
+    inner = [[bm.verts.new(p) for p in skirt_ring(*r, inset=0.003)] for r in SKIRT_RINGS]
+    nr = len(SKIRT_RINGS)
+
+    def band(A, B, va, vb, flip=False):
+        for k in range(n):
+            k2 = (k + 1) % n
+            vs = [A[k], A[k2], B[k2], B[k]]
+            uvs = [(k / n, va), ((k + 1) / n, va), ((k + 1) / n, vb), (k / n, vb)]
+            if flip:
+                vs, uvs = vs[::-1], uvs[::-1]
+            f = bm.faces.new(vs)
+            f.material_index = 0 if 0 < max(va, vb) else 1
+            for loop, t in zip(f.loops, uvs):
+                loop[uv].uv = t
+    for i in range(nr - 1):
+        band(outer[i], outer[i + 1], 1 - i / (nr - 1), 1 - (i + 1) / (nr - 1))
+        band(inner[i], inner[i + 1], 1 - i / (nr - 1), 1 - (i + 1) / (nr - 1), flip=True)
+    band(outer[-1], inner[-1], 0.0, 0.0)                 # hem
+    band(inner[0], outer[0], 1.0, 1.0)                   # top of the waistband
+    for f in bm.faces:                                   # waistband ring in the ribbon red? no: navy
+        f.material_index = 0
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new("Skirt", me)
+    bpy.context.scene.collection.objects.link(ob)
+    me.shade_smooth()
+    assign_materials(ob, ["skirt"])
+    return ob
+
+
+# sailor collar spokes for the left half, front V tip -> back centre: (inner edge, outer edge)
+COLLAR_SPOKES = [
+    ((0.004, -0.080, 1.200), (0.012, -0.083, 1.188)),
+    ((0.012, -0.072, 1.236), (0.046, -0.084, 1.214)),
+    ((0.022, -0.060, 1.272), (0.082, -0.070, 1.250)),
+    ((0.032, -0.045, 1.306), (0.112, -0.048, 1.282)),
+    ((0.042, -0.020, 1.330), (0.138, -0.014, 1.300)),
+    ((0.045, 0.010, 1.344), (0.138, 0.026, 1.298)),
+    ((0.040, 0.040, 1.345), (0.128, 0.066, 1.250)),
+    ((0.030, 0.055, 1.343), (0.122, 0.082, 1.166)),
+    ((0.015, 0.062, 1.342), (0.062, 0.090, 1.162)),
+    ((0.000, 0.064, 1.342), (0.000, 0.092, 1.160)),
+]
+
+
+def build_collar(body):
+    from mathutils.bvhtree import BVHTree
+    dg = bpy.context.evaluated_depsgraph_get()
+    bvh = BVHTree.FromObject(body, dg)
+    left = COLLAR_SPOKES
+    right = [((-a[0], a[1], a[2]), (-b[0], b[1], b[2])) for a, b in reversed(COLLAR_SPOKES[:-1])]
+    spokes = left + right
+    inner_c = [V(a) for a, b in spokes]
+    outer_c = [V(b) for a, b in spokes]
+    nu, rows = 40, (0.0, 0.3, 0.62, 0.80, 0.88, 1.0)
+    me = bpy.data.meshes.new("Collar")
+    bm = bmesh.new()
+    uv = bm.loops.layers.uv.verify()
+
+    def surf(p, off):
+        loc, nrm, _, _ = bvh.find_nearest(p)
+        return loc + nrm * off
+
+    layers = []
+    for off in (0.0045, 0.0018):
+        grid = []
+        for i in range(nu + 1):
+            t = i / nu
+            a, b = catmull_rom(inner_c, t), catmull_rom(outer_c, t)
+            grid.append([bm.verts.new(surf(a.lerp(b, r), off + 0.0015 * r)) for r in rows])
+        layers.append(grid)
+    top, bot = layers
+    nr = len(rows)
+
+    def face(vs, mat, uvs=None):
+        f = bm.faces.new(vs)
+        f.material_index = mat
+        if uvs:
+            for loop, q in zip(f.loops, uvs):
+                loop[uv].uv = q
+    for i in range(nu):
+        for j in range(nr - 1):
+            stripe = 1 if j == 3 else 0
+            uvs = [(i / nu, rows[j]), ((i + 1) / nu, rows[j]), ((i + 1) / nu, rows[j + 1]), (i / nu, rows[j + 1])]
+            face([top[i][j], top[i + 1][j], top[i + 1][j + 1], top[i][j + 1]], stripe, uvs)
+            face([bot[i][j + 1], bot[i + 1][j + 1], bot[i + 1][j], bot[i][j]], 0, uvs[::-1])
+    for i in range(nu):                         # inner and outer edges
+        for j in (0, nr - 1):
+            face([top[i][j], bot[i][j], bot[i + 1][j], top[i + 1][j]], 0)
+    for i in (0, nu):                           # the two ends of the V
+        for j in range(nr - 1):
+            face([top[i][j], top[i][j + 1], bot[i][j + 1], bot[i][j]], 0)
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    # the bow: a knot, two loops and two tails (constant-width ribbons)
+    knot_c = surf(V((0.0, -0.085, 1.196)), 0.007)
+    paths = []
+    for sgn in (-1, 1):
+        loop_pts = [knot_c + V((sgn * dx, -dy, dz)) for dx, dy, dz in
+                    ((0.002, 0.000, 0.000), (0.016, 0.004, 0.010), (0.034, 0.003, 0.009),
+                     (0.040, 0.002, -0.002), (0.030, 0.003, -0.010), (0.012, 0.003, -0.004), (0.003, 0.0, -0.001))]
+        paths.append(([catmull_rom(loop_pts, k / 12) for k in range(13)], 0.0075, False))
+        tail = [knot_c + V((sgn * dx, -dy, dz)) for dx, dy, dz in
+                ((0.002, 0.000, -0.003), (0.010, 0.004, -0.025), (0.016, 0.006, -0.050), (0.020, 0.006, -0.068))]
+        paths.append(([catmull_rom(tail, k / 8) for k in range(9)], 0.0085, True))
+    for pts, w, tap in paths:
+        build_lock(bm, uv, pts, w, 0.0016, 2, None, None, 0, taper=False)
+    k0 = len(bm.verts)
+    bmesh.ops.create_cube(bm, size=1.0, matrix=Matrix.Translation(knot_c) @ Matrix.Diagonal((0.013, 0.008, 0.013, 1)))
+    for f in bm.faces:
+        if f.material_index == 0 and all(v.index >= k0 for v in f.verts if v.index >= 0):
+            pass
+    bm.faces.ensure_lookup_table()
+    for f in bm.faces[-6:]:
+        f.material_index = 2
+    ob = bpy.data.objects.new("Collar", me)
+    bpy.context.scene.collection.objects.link(ob)
+    assign_materials(ob, ["collar", "top", "ribbon"])     # slots first: indices are clamped
+    bm.to_mesh(me)
+    bm.free()
+    me.shade_smooth()
+    return ob
+
+
+def assign_outfit(body, parts):
+    """Paint the body into outfit zones: sailor blouse, collar, socks, shoes."""
+    me = body.data
+    gi = body.vertex_groups["torso"].index
+    in_torso = [any(g.group == gi and g.weight > 0.999 for g in v.groups) for v in me.vertices]
+    torso_faces = {p.index for p in me.polygons if all(in_torso[i] for i in p.vertices)}
+    ga = body.vertex_groups["arm"].index
+    in_arm = [any(g.group == ga and g.weight > 0.0 for g in v.groups) for v in me.vertices]
+    S = {s: parts["arms"][s]["S"] for s in (-1, 1)}
+    E = {s: parts["arms"][s]["E"] for s in (-1, 1)}
+    for poly in me.polygons:
+        if poly.material_index != MAT["skin"]:
+            continue
+        c = poly.center
+        side = 1 if c.x > 0 else -1
+        z = c.z
+        mat = "skin"
+        on_arm = any(in_arm[i] for i in poly.vertices)
+        if on_arm:
+            d = (E[side] - S[side]).normalized()
+            t = (c - S[side]).dot(d)
+            if t < 0.105:
+                mat = "top"
+            elif t < 0.125:
+                mat = "collar"                         # sleeve cuff
+            else:
+                mat = "skin"
+            poly.material_index = MAT[mat]
+            continue
+            if t < 0.105:
+                mat = "top"
+            elif t < 0.125:
+                mat = "collar"                         # sleeve cuff
+        elif 0.70 < z < 1.36 and abs(c.x) < 0.20 and poly.index in torso_faces:
+            mat = "top" if z > 0.985 else "collar"     # blouse; navy shorts under the skirt
+        if z < 0.565 and abs(c.x) < 0.13:
+            mat = "socks"
+        if z < 0.105 and abs(c.x) < 0.13:
+            mat = "shoes"
+        poly.material_index = MAT[mat]
+
+
+# =============================================================================
 #  Materials and the eye texture
 # =============================================================================
 
@@ -1747,6 +2215,13 @@ def main():
     assign_materials(body, sorted(MAT, key=MAT.get))
     body.data.uv_layers.new(name="UVMap")
     face = add_face_details(body, features)
+    hair = build_hair(body)
+    report_mesh(hair)
+    skirt = build_skirt()
+    report_mesh(skirt)
+    assign_outfit(body, parts)
+    collar = build_collar(body)
+    report_mesh(collar)
     if args.save:
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(args.save), compress=True)
         print("saved", args.save)
