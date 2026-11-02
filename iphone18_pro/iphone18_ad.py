@@ -2017,166 +2017,651 @@ def setup_compositor(scene):
 # =============================================================================
 #  Sound design (procedural, numpy only)
 # =============================================================================
+#
+#  A small DSP kit: smooth zero-phase filters, PolyBLEP oscillators, STFT filter
+#  sweeps, stereo convolution reverb, ping-pong delay, sidechain, glue compressor,
+#  look-ahead limiter and an EBU R128-style loudness meter. Plus a score locked to
+#  the picture. At 96 BPM a bar is 2.5 s, so from the reveal on every shot is
+#  exactly two bars and every cut lands on a downbeat.
+#
+#     0.0- 4.5  sub drone. Each iris click has a servo whine, a mechanical tick and a
+#               bell tuned up the A-minor triad (A5, C6, E6). Riser into the reveal
+#     4.5- 9.5  pad Am(add9) | Fmaj7, plucked arpeggio with ping-pong delay,
+#               half-time kick, snare roll and riser into the drop
+#     9.5-14.5  C(add9) | G6, full beat with sidechained pad and sub bass. Impact on
+#               the explode, chip power-up, airflow, reverse swell, latch on the snap-back
+#    14.5-19.5  Am(add9) | Fmaj7 with claps. A laser scan per finish, ending on a
+#               bell tuned to the chord
+#    19.5-24.0  breakdown on Gsus4: spin whoosh, wake chime, riser and reverse
+#               cymbal, final hit resolving to C(add9), long tail
 
 SR = 48000
+BPM = 96.0
+BEAT = 60.0 / BPM
+BAR = 4 * BEAT
 
 
 def _f2s(frame):
     return (frame - 1) / FPS
 
 
-def _env(n, attack, decay, sr=SR):
-    t = np.arange(n) / sr
-    a = np.clip(t / max(attack, 1e-4), 0, 1)
-    return a * np.exp(-np.maximum(t - attack, 0) / max(decay, 1e-4))
+def _hz(note):
+    """'A4' -> 440.0; also 'C#5', 'Bb3'."""
+    k = {"C": -9, "D": -7, "E": -5, "F": -4, "G": -2, "A": 0, "B": 2}[note[0]]
+    i = 1
+    if note[1] in "#b":
+        k += 1 if note[1] == "#" else -1
+        i = 2
+    return 440.0 * 2 ** ((k + 12 * (int(note[i:]) - 4)) / 12)
 
 
-def _bandpass(x, lo, hi, sr=SR):
-    X = np.fft.rfft(x)
-    f = np.fft.rfftfreq(len(x), 1 / sr)
-    X *= (f >= lo) & (f <= hi)
-    return np.fft.irfft(X, len(x))
+def _n(sec):
+    return max(1, int(round(sec * SR)))
 
 
-def _sweep_noise(n, f0, f1, width, rng, sr=SR, block=1024):
-    """Noise through a band-pass whose centre glides f0 -> f1 (log), overlap-add."""
-    out = np.zeros(n + block)
-    win = np.hanning(block)
-    hop = block // 2
-    for i, s in enumerate(range(0, n, hop)):
-        u = s / max(n - 1, 1)
-        fc = f0 * (f1 / f0) ** u
-        seg = rng.standard_normal(block) * win
-        out[s:s + block] += _bandpass(seg, fc / width, fc * width, sr) * win
-    return out[:n]
+# ---------------------------------------------------------------- filters
+
+def _shape(x, gain):
+    """Zero-phase filter: multiply the spectrum by gain(f). Works on (..., n)."""
+    n = x.shape[-1]
+    m = 1 << int(np.ceil(np.log2(n + 8192)))
+    X = np.fft.rfft(x, m, axis=-1)
+    return np.fft.irfft(X * gain(np.fft.rfftfreq(m, 1 / SR)), m, axis=-1)[..., :n]
 
 
-def _place(buf, x, t0, gain=1.0, pan=0.0):
-    i = int(t0 * SR)
-    if i >= buf.shape[1]:
-        return
-    x = x[:buf.shape[1] - i]
-    l, r = math.cos((pan + 1) * math.pi / 4), math.sin((pan + 1) * math.pi / 4)
-    buf[0, i:i + len(x)] += gain * l * x
-    buf[1, i:i + len(x)] += gain * r * x
+def _glp(f, fc, order):
+    return 1.0 / np.sqrt(1.0 + (f / fc) ** (2 * order))
+
+
+def _ghp(f, fc, order):
+    return 1.0 / np.sqrt(1.0 + (fc / np.maximum(f, 1e-3)) ** (2 * order))
+
+
+def lp(x, fc, order=2):
+    return _shape(x, lambda f: _glp(f, fc, order))
+
+
+def hp(x, fc, order=2):
+    return _shape(x, lambda f: _ghp(f, fc, order))
+
+
+def bp(x, lo, hi, order=2):
+    return _shape(x, lambda f: _ghp(f, lo, order) * _glp(f, hi, order))
+
+
+def shelf(x, fc, db, high=False):
+    g = 10 ** (db / 20)
+
+    def gain(f):
+        w = 1 / (1 + (fc / np.maximum(f, 1e-3)) ** 2) if high else 1 / (1 + (f / fc) ** 2)
+        return 1 + (g - 1) * w
+    return _shape(x, gain)
+
+
+def sweep(x, fc_of_t, kind="lp", order=2, width=1.6, frame=2048, hop=512):
+    """Time-varying filter (STFT overlap-add). fc_of_t(seconds) -> cutoff/centre in Hz."""
+    mono = x.ndim == 1
+    xs = x[None] if mono else x
+    n = xs.shape[-1]
+    win = np.hanning(frame)
+    pad = np.zeros((xs.shape[0], n + 2 * frame))
+    pad[:, frame:frame + n] = xs
+    out = np.zeros_like(pad)
+    norm = np.zeros(pad.shape[-1])
+    f = np.fft.rfftfreq(frame, 1 / SR)
+    for s in range(0, pad.shape[-1] - frame, hop):
+        fc = max(20.0, float(fc_of_t((s + frame / 2 - frame) / SR)))
+        if kind == "lp":
+            g = _glp(f, fc, order)
+        elif kind == "hp":
+            g = _ghp(f, fc, order)
+        else:
+            g = _ghp(f, fc / width, order) * _glp(f, fc * width, order)
+        out[:, s:s + frame] += np.fft.irfft(np.fft.rfft(pad[:, s:s + frame] * win, axis=-1) * g, frame, axis=-1) * win
+        norm[s:s + frame] += win * win
+    out = out[:, frame:frame + n] / np.maximum(norm[frame:frame + n], 1e-6)
+    return out[0] if mono else out
+
+
+def interp_fn(points, log=True):
+    """Breakpoint curve [(t, value)] -> f(t), interpolated in log space by default."""
+    ts = np.array([p[0] for p in points], float)
+    vs = np.array([p[1] for p in points], float)
+    if log:
+        return lambda t: float(np.exp(np.interp(t, ts, np.log(vs))))
+    return lambda t: float(np.interp(t, ts, vs))
+
+
+# ---------------------------------------------------------------- oscillators, envelopes
+
+def _phase(freq, n):
+    return np.cumsum(np.broadcast_to(np.asarray(freq, float), (n,))) / SR
+
+
+def sine(freq, n, ph=0.0):
+    return np.sin(2 * np.pi * (_phase(freq, n) + ph))
+
+
+def saw(freq, n, ph=0.0):
+    """Band-limited (PolyBLEP) sawtooth."""
+    dt = np.broadcast_to(np.asarray(freq, float), (n,)) / SR
+    p = (ph + np.cumsum(dt)) % 1.0
+    y = 2 * p - 1
+    a = p < dt
+    t = p[a] / dt[a]
+    y[a] -= t + t - t * t - 1
+    b = p > 1 - dt
+    t = (p[b] - 1) / dt[b]
+    y[b] -= t * t + t + t + 1
+    return y
+
+
+def env(n, a=0.002, d=0.3, hold=0.0):
+    t = np.arange(n) / SR
+    att = np.clip(t / max(a, 1e-5), 0, 1) ** 1.5
+    return att * np.exp(-np.maximum(t - a - hold, 0) / max(d, 1e-5))
+
+
+def gate(n, a, r, length):
+    """Attack, sustain for `length` s, release; smooth (raised cosine) edges."""
+    t = np.arange(n) / SR
+    up = 0.5 - 0.5 * np.cos(np.pi * np.clip(t / max(a, 1e-5), 0, 1))
+    dn = 0.5 + 0.5 * np.cos(np.pi * np.clip((t - length) / max(r, 1e-5), 0, 1))
+    return up * dn
+
+
+def fades(x, fin=0.002, fout=0.01):
+    n = x.shape[-1]
+    k1, k2 = min(n, _n(fin)), min(n, _n(fout))
+    x = np.array(x, float)
+    x[..., :k1] *= np.linspace(0, 1, k1)
+    x[..., n - k2:] *= np.linspace(1, 0, k2)
+    return x
+
+
+def stereo(x, pan=0.0, width=0.0, rng=None):
+    """Mono -> stereo with equal-power pan; `width` adds a short Haas-style decorrelation."""
+    l, r = math.cos((pan + 1) * math.pi / 4) * math.sqrt(2), math.sin((pan + 1) * math.pi / 4) * math.sqrt(2)
+    out = np.stack([x * l, x * r])
+    if width > 0:
+        d = _n(0.011)
+        side = np.concatenate([np.zeros(d), x[:-d]]) if len(x) > d else np.zeros_like(x)
+        out[0] += width * 0.5 * side
+        out[1] -= width * 0.5 * side
+    return out
+
+
+def autopan(x, p0, p1):
+    n = x.shape[-1]
+    p = np.linspace(p0, p1, n)
+    return np.stack([x * np.cos((p + 1) * np.pi / 4), x * np.sin((p + 1) * np.pi / 4)]) * math.sqrt(2)
+
+
+# ---------------------------------------------------------------- instruments
+
+class Kit:
+    def __init__(self, rng):
+        self.rng = rng
+
+    def noise(self, n):
+        return self.rng.standard_normal(n)
+
+    def kick(self, vel=1.0):
+        n = _n(0.55)
+        t = np.arange(n) / SR
+        f = 52 + 115 * np.exp(-t / 0.030)
+        body = sine(f, n) * env(n, 0.001, 0.21)
+        click = hp(self.noise(n) * env(n, 0.0002, 0.003), 1800) * 0.5
+        knock = bp(self.noise(n), 900, 2500) * env(n, 0.0005, 0.012) * 0.25
+        y = np.tanh(1.8 * (body + click + knock)) / np.tanh(1.8)
+        return fades(y * vel)
+
+    def hat(self, open_=False, vel=1.0):
+        n = _n(0.35 if open_ else 0.09)
+        metal = sum(np.sign(sine(f, n, self.rng.random())) for f in (3150, 4270, 5210, 6390, 7480, 9010)) / 6
+        y = hp(0.55 * self.noise(n) + 0.45 * metal, 7200, 3) * env(n, 0.0005, 0.12 if open_ else 0.028)
+        return fades(y * vel)
+
+    def clap(self, vel=1.0):
+        n = _n(0.45)
+        e = np.zeros(n)
+        for k, g in ((0.0, 1.0), (0.009, 0.8), (0.019, 0.9)):
+            e += g * np.roll(env(n, 0.0003, 0.006), _n(k)) * (np.arange(n) >= _n(k))
+        e += 0.55 * np.roll(env(n, 0.001, 0.12), _n(0.022)) * (np.arange(n) >= _n(0.022))
+        y = bp(self.noise(n) * e, 950, 6500)
+        y += 0.25 * sine(190, n) * env(n, 0.001, 0.03)
+        return fades(y * vel)
+
+    def crash(self, length=2.6, vel=1.0):
+        n = _n(length)
+        st = np.stack([self.noise(n), self.noise(n)])
+        partials = sum(sine(f, n, self.rng.random()) for f in (3900, 5230, 6870, 8410, 10950)) / 5
+        y = hp(st + 0.35 * partials, 3400, 2) * env(n, 0.002, length * 0.32)
+        return fades(shelf(y, 9000, -4, high=True) * vel)
+
+    def sub_boom(self, f0=80, f1=30, length=2.4, vel=1.0):
+        n = _n(length)
+        t = np.arange(n) / SR
+        f = f1 + (f0 - f1) * np.exp(-t / 0.18)
+        y = sine(f, n) + 0.22 * sine(2 * f, n)
+        return fades(np.tanh(1.4 * y * env(n, 0.004, length * 0.38)) * vel)
+
+    def impact(self, vel=1.0):
+        """Cinematic hit: sub drop, low body, crack, metallic shing."""
+        n = _n(3.0)
+        y = np.zeros((2, n))
+        sub = stereo(self.sub_boom(72, 40, 1.8))
+        y[:, :sub.shape[-1]] += sub
+        y += stereo(lp(self.noise(n), 320, 3) * env(n, 0.002, 0.30) * 1.2)
+        y += stereo(hp(self.noise(n), 2500) * env(n, 0.0003, 0.012) * 0.9, width=0.6)
+        t = np.arange(n) / SR
+        for i, (f, g, d) in enumerate(((1190, 0.30, 0.9), (1733, 0.25, 0.8), (2612, 0.18, 0.7),
+                                       (3927, 0.12, 0.6), (5520, 0.07, 0.45))):
+            tone = sine(f * (1 - 0.03 * (1 - np.exp(-t / 0.4))), n, self.rng.random()) * env(n, 0.001, d)
+            y += stereo(tone * g, pan=(-0.7, 0.6, -0.3, 0.8, 0.0)[i])
+        return fades(y * vel)
+
+    def whoosh(self, length, f0, f1, pan0=-0.8, pan1=0.8, vel=1.0, tone=True):
+        n = _n(length)
+        u = np.linspace(0, 1, n)
+        shape = np.sin(np.pi * np.clip(u / 0.62, 0, 1) * 0.5) ** 2 * np.clip((1 - u) / 0.38, 0, 1) ** 1.5
+        x = sweep(self.noise(n), lambda tt: f0 * (f1 / f0) ** np.clip(tt / length, 0, 1), "bp", width=1.9)
+        x = x * shape
+        if tone:
+            ft = 520 * (0.55 ** u)
+            x += 0.18 * lp(saw(ft, n), 1600) * shape
+        return fades(autopan(x / (np.abs(x).max() + 1e-9), pan0, pan1) * vel, 0.01, 0.02)
+
+    def riser(self, length, f0=180, f1=7000, vel=1.0):
+        n = _n(length)
+        u = np.linspace(0, 1, n)
+        noise = sweep(np.stack([self.noise(n), self.noise(n)]), lambda tt: f0 * (f1 / f0) ** np.clip(tt / length, 0, 1),
+                      "hp", order=2)
+        pitch = 110 * 2 ** (2.0 * u ** 1.6)
+        tones = sum(saw(pitch * d, n, self.rng.random()) for d in (0.993, 1.0, 1.007)) / 3
+        tones = sweep(tones, lambda tt: 300 * (25 ** np.clip(tt / length, 0, 1)), "lp")
+        y = noise * 0.9 + stereo(tones * 0.35, width=0.8)
+        return fades(y * (u ** 2.2) * vel, 0.05, 0.004)
+
+    def reverse_cymbal(self, length=1.4, vel=1.0):
+        c = self.crash(length + 0.4)[:, :_n(length)]
+        return fades(c[:, ::-1] * vel, 0.05, 0.003)
+
+    def lens_tick(self, vel=1.0):
+        """Servo motor whine, then the blade stop: transient + resonant tick + thump."""
+        n_m, n_c = _n(0.12), _n(0.45)
+        t = np.arange(n_m) / SR
+        f = 210 * (1 + 0.35 * t / t[-1])
+        motor = sum(g * sine(f * h, n_m) for h, g in ((1, 1), (2, 0.6), (3, 0.45), (5, 0.25), (7, 0.15)))
+        motor = bp(motor * (0.6 + 0.4 * sine(38, n_m)), 600, 5000) * np.linspace(0.2, 1, n_m) ** 2 * 0.12
+        c = hp(self.noise(n_c), 2600, 3) * env(n_c, 0.0002, 0.0025)
+        c += sum(g * sine(fr, n_c, self.rng.random()) * env(n_c, 0.0003, d)
+                 for fr, g, d in ((2870, 0.40, 0.020), (4310, 0.30, 0.014), (6650, 0.18, 0.009)))
+        tt = np.arange(n_c) / SR
+        c += 0.55 * sine(60 + 70 * np.exp(-tt / 0.012), n_c) * env(n_c, 0.0005, 0.035)
+        return fades(np.concatenate([motor, c]) * vel)
+
+    def bell(self, f, length=2.4, ratio=3.5, index=1.6, vel=1.0):
+        n = _n(length)
+        t = np.arange(n) / SR
+        mod = sine(f * ratio, n) * index * np.exp(-t / 0.25)
+        y = np.sin(2 * np.pi * _phase(f, n) + mod) * env(n, 0.002, length * 0.33)
+        y += 0.25 * sine(2 * f, n) * env(n, 0.002, length * 0.15)
+        return fades(y * vel)
+
+    def pluck(self, f, length=0.7, vel=1.0):
+        n = _n(length)
+        t = np.arange(n) / SR
+        mod = sine(2 * f, n) * 2.8 * np.exp(-t / 0.035)
+        y = np.sin(2 * np.pi * _phase(f, n) + mod) * env(n, 0.0015, 0.20)
+        return fades(lp(y, 6000) * vel)
+
+    def pad(self, notes, length, attack=0.35, release=0.9, cents=9.0, cutoff=2500.0):
+        """Supersaw-style pad: three detuned PolyBLEP saws per note, spread L/R, through a
+        low-pass whose cutoff also opens a little over the note (filter envelope)."""
+        n = _n(length + release)
+        g = gate(n, attack, release, length)
+        out = np.zeros((2, n))
+        for note in notes:
+            f = _hz(note) if isinstance(note, str) else note
+            d = 2 ** (cents / 1200)
+            s_lo, s_mid, s_hi = (saw(f * k, n, self.rng.random()) for k in (1 / d, 1.0, d))
+            out[0] += s_lo + 0.7 * s_mid
+            out[1] += s_hi + 0.7 * s_mid
+            out += 0.25 * sine(f, n)
+        out = sweep(out, lambda tt: cutoff * (0.6 + 0.4 * min(1.0, tt / max(length, 0.1))), "lp", order=2)
+        return out * g / max(1, len(notes))
+
+    def bass(self, f, length, vel=1.0):
+        """Mid-bass that small speakers can reproduce, with a quieter sine sub an octave down."""
+        n = _n(length)
+        y = 0.55 * sine(f, n) + 0.40 * sine(f / 2, n) + 0.30 * lp(saw(f, n), 900, 3)
+        return fades(np.tanh(1.3 * y * env(n, 0.003, length * 1.4)) * vel, 0.003, 0.03)
+
+    def zap(self, f0, f1, length=0.9, vel=1.0):
+        n = _n(length)
+        u = np.linspace(0, 1, n)
+        f = f0 * (f1 / f0) ** (u ** 0.8)
+        tone = np.sin(2 * np.pi * _phase(f, n) + 0.6 * sine(f * 2.01, n))
+        swish = sweep(self.noise(n), lambda tt: 1.5 * f0 * (f1 / f0) ** np.clip(tt / length, 0, 1), "bp", width=1.5)
+        shape = np.sin(np.pi * u) ** 1.5
+        return fades(stereo(0.45 * tone * shape, width=0.5) + autopan(0.9 * swish * shape / (np.abs(swish).max() + 1e-9), -0.4, 0.4)) * vel
+
+    def blips(self, notes, step=0.07, vel=1.0):
+        n = _n(step * len(notes) + 0.4)
+        out = np.zeros((2, n))
+        for i, nt in enumerate(notes):
+            k = _n(0.06)
+            b = lp(saw(_hz(nt), k), 3500) * env(k, 0.001, 0.025)
+            s = _n(i * step)
+            out[:, s:s + k] += stereo(b, pan=(-0.6, 0.6)[i % 2])
+        return out * vel
+
+    def airflow(self, length, vel=1.0):
+        n = _n(length)
+        y = np.stack([self.noise(n), self.noise(n)])
+        y = sweep(y, lambda tt: 900 + 700 * math.sin(2 * math.pi * 0.7 * tt), "lp", order=2)
+        return fades(y * gate(n, 0.6, 0.8, length - 0.8) * vel, 0.05, 0.1)
+
+    def latch(self, vel=1.0):
+        n = _n(0.5)
+        y = np.zeros(n)
+        for k, g in ((0.0, 1.0), (0.034, 0.7)):
+            s = _n(k)
+            c = hp(self.noise(n - s), 2000, 3) * env(n - s, 0.0002, 0.004)
+            c += 0.4 * sine(3300, n - s) * env(n - s, 0.0003, 0.012)
+            y[s:] += g * c
+        tt = np.arange(n) / SR
+        y += 0.7 * sine(55 + 90 * np.exp(-tt / 0.02), n) * env(n, 0.001, 0.09)
+        return fades(y * vel)
+
+
+# ---------------------------------------------------------------- effects and mastering
+
+def make_ir(rng, length, rt60, predelay, damp=3500.0, early=10):
+    n = _n(length)
+    t = np.arange(n) / SR
+    noise = rng.standard_normal((2, n))
+    lo = lp(noise, damp)
+    ir = lo * np.exp(-6.9 * t / rt60) + (noise - lo) * np.exp(-6.9 * t / (rt60 * 0.45))
+    ir *= np.clip(t / 0.03, 0, 1)
+    for c in range(2):
+        for _ in range(early):
+            k = _n(rng.uniform(0.004, 0.05))
+            ir[c, k] += rng.choice((-1, 1)) * 2.5 * math.exp(-k / SR / 0.03)
+    d = _n(predelay)
+    ir = np.concatenate([np.zeros((2, d)), ir[:, :n - d]], axis=1)
+    return ir / math.sqrt((ir ** 2).sum() / 2)
+
+
+def convolve(x, ir):
+    n = x.shape[-1]
+    m = 1 << int(np.ceil(np.log2(n + ir.shape[-1])))
+    return np.fft.irfft(np.fft.rfft(x, m, axis=-1) * np.fft.rfft(ir, m, axis=-1), m, axis=-1)[:, :n]
+
+
+def pingpong(x, delay, taps=((0, 0.42), (1, 0.28), (0, 0.17), (1, 0.10)), damp=4500):
+    n = x.shape[-1]
+    mono = lp(x.mean(0), damp)
+    out = np.zeros((2, n))
+    for i, (ch, g) in enumerate(taps):
+        d = _n(delay * (i + 1))
+        if d < n:
+            out[ch, d:] += g * mono[:n - d]
+    return out
+
+
+def sidechain(n, hits, depth=0.55, release=0.16, attack=0.004):
+    """Gain curve that dips at each hit time and recovers exponentially."""
+    t = np.arange(n) / SR
+    hits = np.sort(np.asarray(hits, float))
+    idx = np.searchsorted(hits, t, side="right") - 1
+
+    def dip(k):
+        ok = k >= 0
+        out = np.zeros(n)
+        dt = t[ok] - hits[k[ok]]
+        out[ok] = depth * np.clip(dt / attack, 0, 1) * np.exp(-np.maximum(dt - attack, 0) / release)
+        return out
+    # the newest hit ramps in while the previous one is still releasing: no steps, no clicks
+    return 1 - np.maximum(dip(idx), dip(idx - 1))
+
+
+def _block_env(x, blk):
+    n = x.shape[-1]
+    nb = int(math.ceil(n / blk))
+    pad = np.zeros((x.shape[0], nb * blk))
+    pad[:, :n] = x
+    return pad, nb
+
+
+def compress(x, thresh_db=-20.0, ratio=2.0, attack=0.012, release=0.18, blk=240):
+    pad, nb = _block_env(x, blk)
+    rms = np.sqrt((pad ** 2).mean(0).reshape(nb, blk).mean(1) + 1e-12)
+    lvl = 20 * np.log10(rms)
+    want = np.maximum(lvl - thresh_db, 0) * (1 - 1 / ratio)
+    a, r = math.exp(-blk / (attack * SR)), math.exp(-blk / (release * SR))
+    gr, cur = np.empty(nb), 0.0
+    for i, w in enumerate(want):
+        cur = w + (cur - w) * (a if w > cur else r)
+        gr[i] = cur
+    g = 10 ** (-np.interp(np.arange(x.shape[-1]), np.arange(nb) * blk + blk / 2, gr) / 20)
+    return x * g
+
+
+def limit(x, ceiling_db=-1.0, look=0.005, release=0.09, blk=48):
+    c = 10 ** (ceiling_db / 20)
+    pad, nb = _block_env(x, blk)
+    peaks = np.abs(pad).max(0).reshape(nb, blk).max(1)
+    la = int(look * SR / blk) + 1
+    ext = np.concatenate([peaks, np.zeros(la)])
+    pk = np.lib.stride_tricks.sliding_window_view(ext, la + 1).max(1)[:nb]
+    target = np.minimum(1.0, c / np.maximum(pk, 1e-9))
+    rel = math.exp(-blk / (release * SR))
+    g, cur = np.empty(nb), 1.0
+    for i, tg in enumerate(target):
+        cur = tg if tg < cur else tg + (cur - tg) * rel
+        g[i] = cur
+    gs = np.interp(np.arange(x.shape[-1]), np.arange(nb) * blk, g)
+    return x * gs
+
+
+def loudness(x):
+    """Integrated loudness (LUFS), BS.1770-style K-weighting and gating."""
+    k = _shape(x, lambda f: _ghp(f, 38, 2) * (1 + (10 ** (4 / 20) - 1) / (1 + (1500 / np.maximum(f, 1e-3)) ** 2)))
+    blk, hop = _n(0.4), _n(0.1)
+    ms = np.array([(k[:, s:s + blk] ** 2).mean(1).sum() for s in range(0, k.shape[-1] - blk, hop)])
+    lk = -0.691 + 10 * np.log10(ms + 1e-12)
+    ms = ms[lk > -70]
+    rel = -0.691 + 10 * np.log10(ms.mean() + 1e-12) - 10
+    ms = ms[(-0.691 + 10 * np.log10(ms + 1e-12)) > rel]
+    return -0.691 + 10 * np.log10(ms.mean() + 1e-12)
+
+
+def true_peak(x):
+    """Peak level (dBFS) of the 4x-oversampled signal."""
+    m = 1 << int(np.ceil(np.log2(x.shape[-1])))
+    y = np.fft.irfft(np.fft.rfft(x, m, axis=-1), 4 * m, axis=-1) * 4
+    return 20 * np.log10(np.abs(y).max() + 1e-12)
+
+
+# ---------------------------------------------------------------- the score
+
+class Mix:
+    def __init__(self, n):
+        self.n = n
+        self.bus = {k: np.zeros((2, n)) for k in ("music", "drums", "sfx", "hall", "plate", "delay")}
+
+    def add(self, x, t0, bus="sfx", gain=1.0, pan=0.0, hall=0.0, plate=0.0, delay=0.0):
+        x = np.asarray(x, float)
+        if x.ndim == 1:
+            x = stereo(x, pan)
+        x = x * gain
+        s = _n(t0) if t0 > 0 else 0
+        if t0 < 0:
+            x = x[:, _n(-t0):]
+        e = min(self.n, s + x.shape[-1])
+        if e <= s:
+            return
+        seg = x[:, :e - s]
+        self.bus[bus][:, s:e] += seg
+        for name, amt in (("hall", hall), ("plate", plate), ("delay", delay)):
+            if amt:
+                self.bus[name][:, s:e] += seg * amt
 
 
 def make_soundtrack(path, seed=9):
     rng = np.random.default_rng(seed)
+    kit = Kit(rng)
     dur = FRAME_END / FPS + 0.5
     n = int(dur * SR)
+    mx = Mix(n)
+    t_rev, t_ins, t_fin, t_hero = (_f2s(SHOTS[k][0]) for k in ("reveal", "inside", "finish", "hero"))
+    bar = lambda k: t_rev + (k - 1) * BAR            # bar 1 = the reveal (4.5 s)
+    t_explode = _f2s(SHOTS["inside"][0] + 12)
+    t_glow = _f2s(SHOTS["inside"][0] + 40)
+    t_snap = _f2s(SHOTS["inside"][1] - 6)
+    t_wake = _f2s(SHOTS["hero"][0] + 25)
+    t_title = _f2s(SHOTS["hero"][0] + 44)
+
+    chords = {1: ["A3", "C4", "E4", "B4"], 2: ["F3", "A3", "C4", "E4"], 3: ["C4", "E4", "G4", "D5"],
+              4: ["G3", "B3", "D4", "E4"], 5: ["A3", "C4", "E4", "B4"], 6: ["F3", "A3", "C4", "E4"]}
+    roots = {1: "A1", 2: "F1", 3: "C2", 4: "G1", 5: "A1", 6: "F1"}
+
+    # ---- 1. iris: drone, tuned lens ticks, riser into the reveal
+    nd = _n(t_rev + 0.6)
+    td = np.arange(nd) / SR
+    drone = (sine(55, nd) * 0.25 + sine(110, nd) * 0.35 + sine(164.81, nd) * 0.18 + sine(220.5, nd) * 0.08)
+    drone *= (0.8 + 0.2 * sine(0.23, nd)) * np.clip(td / 1.8, 0, 1) ** 2 * np.clip((t_rev + 0.6 - td) / 0.6, 0, 1)
+    air = lp(hp(rng.standard_normal((2, nd)), 1800), 7000) * 0.06 * np.clip(td / 2.5, 0, 1)
+    mx.add(stereo(drone, width=0.3) + air, 0.0, "music", gain=0.18, hall=0.2)
+    for (f, _fstop), note in zip(IRIS_STEPS[1:], ("A5", "C6", "E6")):
+        t0 = _f2s(f)
+        tick = kit.lens_tick()
+        mx.add(tick, t0 - 0.12, "sfx", gain=0.55, pan=-0.15, plate=0.25)
+        mx.add(kit.bell(_hz(note), 2.6), t0, "sfx", gain=0.16, pan=0.2, hall=0.55, delay=0.25)
+    mx.add(kit.riser(1.6, 300, 9000), t_rev - 1.6, "sfx", gain=0.22, hall=0.3)
+
+    # ---- 2. reveal: whoosh and soft sub on the cut
+    mx.add(kit.whoosh(1.5, 250, 4200, -0.8, 0.8), t_rev - 0.55, "sfx", gain=0.55, hall=0.35)
+    mx.add(kit.sub_boom(70, 42, 1.4), t_rev, "sfx", gain=0.45)
+
+    # ---- music: pad, arp, bass
+    cutoffs = {1: 900, 2: 1400, 3: 2400, 4: 2800, 5: 3000, 6: 3400}     # the pad opens up as the ad builds
+    for k in range(1, 7):
+        mx.add(kit.pad(chords[k], BAR, attack=0.25 if k > 1 else 0.6, release=0.5, cutoff=cutoffs[k]), bar(k),
+               "music", gain=0.22, hall=0.35)
+    mx.add(kit.pad(["G3", "C4", "D4", "G4"], t_title - t_hero, attack=0.15, release=0.4, cutoff=1100),
+           t_hero, "music", gain=0.20, hall=0.45)
+    mx.add(kit.pad(["C3", "G3", "C4", "D4", "E4", "G4"], dur - t_title - 0.6, attack=0.02, release=1.2,
+                   cutoff=3600), t_title, "music", gain=0.26, hall=0.5)
+    steps = [0, 2, 4, 1, 3, 5, 2, 4]
+    for k in range(2, 7):
+        tones = [_hz(x) * 2 for x in chords[k]] + [_hz(chords[k][0]) * 4, _hz(chords[k][2]) * 4]
+        for i, s in enumerate(steps):
+            vel = 1.0 if i % 2 == 0 else 0.7
+            mx.add(kit.pluck(tones[s], 0.6, vel), bar(k) + i * BEAT / 2, "music", gain=0.10,
+                   pan=(-0.35, 0.35)[i % 2], hall=0.25, delay=0.45)
+    for k in range(3, 7):
+        for i in range(8):
+            f = _hz(roots[k]) * (4 if i % 4 == 3 else 2)          # mid-bass; Kit.bass adds the sub
+            mx.add(kit.bass(f, BEAT / 2 * 0.95, 1.0 if i % 2 == 0 else 0.8), bar(k) + i * BEAT / 2, "music",
+                   gain=0.30)
+
+    # ---- drums
+    kicks = [bar(2), bar(2) + 2 * BEAT]
+    for k in range(3, 7):
+        kicks += [bar(k) + i * BEAT for i in range(4)]
+    kicks = [tk for tk in kicks if abs(tk - t_explode) > 0.2]
+    for tk in kicks:
+        mx.add(kit.kick(), tk, "drums", gain=0.62)
+    for k in range(3, 7):
+        for i in range(8):
+            open_ = i % 2 == 1
+            mx.add(kit.hat(open_, 0.9 if open_ else 0.55), bar(k) + i * BEAT / 2, "drums", gain=0.13,
+                   pan=0.25, plate=0.05)
+    for k in (5, 6):
+        for b in (1, 3):
+            mx.add(kit.clap(), bar(k) + b * BEAT, "drums", gain=0.30, plate=0.35)
+    for i in range(8):                                     # snare roll into the drop
+        mx.add(kit.clap(0.25 + 0.75 * i / 7), bar(3) - BEAT + i * BEAT / 8, "drums", gain=0.18, plate=0.3)
+    mx.add(kit.riser(BAR, 200, 8000), bar(3) - BAR, "sfx", gain=0.20, hall=0.25)
+    mx.add(kit.crash(2.6), bar(3), "drums", gain=0.30, hall=0.3)
+    mx.add(kit.crash(1.8, 0.6), bar(5), "drums", gain=0.25, hall=0.3)
+
+    # ---- 3. inside: impact, power-up, airflow, snap-back
+    mx.add(kit.impact(), t_explode, "sfx", gain=0.75, hall=0.45)
+    mx.add(kit.whoosh(1.0, 3000, 300, 0.5, -0.5, tone=False), t_explode - 0.15, "sfx", gain=0.30, hall=0.3)
+    up = _n(0.8)
+    tt = np.arange(up) / SR
+    power = np.sin(2 * np.pi * _phase(220 * 4 ** (tt / tt[-1]), up) + 1.2 * sine(330 * 4 ** (tt / tt[-1]), up))
+    mx.add(stereo(lp(power, 5000) * (tt / tt[-1]) ** 2 * 0.5, width=0.7), t_glow, "sfx", gain=0.22, hall=0.3,
+           delay=0.2)
+    mx.add(kit.blips(["E6", "A6", "B6", "E7", "C7", "A6", "E7", "B7"], 0.06), t_glow + 0.8, "sfx", gain=0.12,
+           delay=0.5, hall=0.2)
+    mx.add(kit.airflow(2.4), t_glow + 0.9, "sfx", gain=0.12, hall=0.2)
+    rev = kit.impact(0.5)[:, :_n(0.9)][:, ::-1]
+    mx.add(fades(rev, 0.05, 0.004), t_snap - 0.9, "sfx", gain=0.35, hall=0.4)
+    mx.add(kit.latch(), t_snap, "sfx", gain=0.55, plate=0.3)
+
+    # ---- 4. finish: one tuned laser scan per colour, ending on a bell
+    a4 = SHOTS["finish"][0]
+    for (s_off, e_off), note in zip(((12, 34), (42, 64), (72, 94), (100, 117)), ("E5", "A5", "C6", "E6")):
+        ts, te = _f2s(a4 + s_off), _f2s(a4 + e_off)
+        f_end = _hz(note)
+        mx.add(kit.zap(f_end / 4, f_end, te - ts + 0.1), ts, "sfx", gain=0.20, hall=0.3)
+        mx.add(kit.bell(f_end, 1.8, ratio=2.0, index=0.8), te, "sfx", gain=0.12, hall=0.45, delay=0.3)
+
+    # ---- 5. hero: spin, wake chime, riser, final hit
+    mx.add(kit.whoosh(0.9, 600, 5000, 0.7, -0.7), t_hero - 0.15, "sfx", gain=0.45, hall=0.3)
+    for i, note in enumerate(("C6", "G6", "E7")):
+        mx.add(kit.bell(_hz(note), 2.2, ratio=2.0, index=0.7), t_wake + i * 0.055, "sfx", gain=0.11,
+               pan=(-0.3, 0.0, 0.3)[i], hall=0.5)
+    mx.add(kit.riser(t_title - t_wake, 250, 10000), t_wake, "sfx", gain=0.22, hall=0.2)
+    mx.add(kit.reverse_cymbal(1.3), t_title - 1.3, "sfx", gain=0.35, hall=0.2)
+    mx.add(kit.impact(), t_title, "sfx", gain=0.85, hall=0.55)
+    mx.add(kit.crash(3.2), t_title, "drums", gain=0.40, hall=0.45)
+    for i, note in enumerate(("C5", "E5", "G5", "C6")):
+        mx.add(kit.pluck(_hz(note), 1.6), t_title + i * 0.11, "music", gain=0.12, hall=0.5, delay=0.4)
+
+    # ---- mix: sidechain music to the kick, duck everything under the two big hits
+    b = mx.bus
+    b["music"] *= sidechain(n, kicks, depth=0.5, release=0.17)
+    duck = sidechain(n, [t_explode, t_title], depth=0.45, release=0.6, attack=0.01)
+    b["music"] *= duck
+    b["drums"] *= sidechain(n, [t_title], depth=0.5, release=0.8, attack=0.01)
+    hall = convolve(b["hall"] + 0.35 * pingpong(b["delay"], 0.75 * BEAT), make_ir(rng, 3.2, 2.4, 0.024, 3200))
+    plate = convolve(b["plate"], make_ir(rng, 1.4, 0.9, 0.008, 7000, early=4))
+    delay = pingpong(b["delay"], 0.75 * BEAT)                  # dotted eighth
+    music = shelf(hp(b["music"], 32), 250, -1.5) + 0.0
+    drums = hp(b["drums"], 30)
+    sfx = hp(b["sfx"], 25)
+    mixd = music + drums + sfx + 0.55 * hall + 0.35 * plate + 0.30 * delay
+
+    # ---- master: glue compression, gentle tilt, loudness to -14 LUFS, -1 dBTP limit
     t = np.arange(n) / SR
-    buf = np.zeros((2, n))
-    S = {k: (_f2s(a), _f2s(b)) for k, (a, b) in SHOTS.items()}
-
-    # pad: A minor add9, slow swells per shot, detuned for width
-    vol = np.interp(t, [0, 1.5, S["reveal"][0], S["inside"][0], S["finish"][0], S["hero"][0], dur - 2.5, dur],
-                    [0, 0.5, 0.8, 0.65, 0.75, 0.9, 0.7, 0.0])
-    for f, g in ((55.0, 0.5), (110.0, 0.35), (164.8, 0.22), (220.0, 0.16), (246.9, 0.10), (329.6, 0.07)):
-        for ch, det in ((0, 0.997), (1, 1.003)):
-            lfo = 0.75 + 0.25 * np.sin(2 * np.pi * (0.07 + 0.01 * ch) * t + f)
-            buf[ch] += 0.11 * g * vol * lfo * np.sin(2 * np.pi * f * det * t)
-    air = _bandpass(rng.standard_normal(n), 2500, 9000) * 0.012 * vol
-    buf += air
-
-    # aperture clicks: metallic tick + thud
-    for f, _fn in IRIS_STEPS[1:]:
-        k = int(0.4 * SR)
-        x = _bandpass(rng.standard_normal(k), 3000, 12000) * _env(k, 0.0005, 0.006)
-        for fr, g in ((2380, 0.5), (3710, 0.35), (5150, 0.25)):
-            x += g * np.sin(2 * np.pi * fr * np.arange(k) / SR) * _env(k, 0.0005, 0.045)
-        x += 0.8 * np.sin(2 * np.pi * 70 * np.arange(k) / SR) * _env(k, 0.002, 0.05)
-        _place(buf, x, _f2s(f), 0.16, -0.2)
-
-    def whoosh(t0, length, f0, f1, gain, pan0=-0.6, pan1=0.6):
-        k = int(length * SR)
-        x = _sweep_noise(k, f0, f1, 1.6, rng) * np.sin(np.linspace(0, np.pi, k)) ** 2
-        half = k // 2
-        _place(buf, x[:half], t0, gain, pan0)
-        _place(buf, x[half:], t0 + half / SR, gain, pan1)
-
-    def boom(t0, gain, f0=95, f1=38, length=1.6):
-        k = int(length * SR)
-        tt = np.arange(k) / SR
-        ph = 2 * np.pi * np.cumsum(f1 + (f0 - f1) * np.exp(-tt / 0.08)) / SR
-        x = np.sin(ph) * _env(k, 0.003, 0.45)
-        x += _bandpass(rng.standard_normal(k), 200, 3000) * _env(k, 0.001, 0.05) * 0.4
-        _place(buf, x, t0, gain)
-
-    def kick(t0, gain):
-        k = int(0.35 * SR)
-        tt = np.arange(k) / SR
-        ph = 2 * np.pi * np.cumsum(45 + 80 * np.exp(-tt / 0.03)) / SR
-        _place(buf, np.sin(ph) * _env(k, 0.002, 0.11), t0, gain)
-
-    def zap(t0, gain, pan):
-        k = int(0.9 * SR)
-        tt = np.arange(k) / SR
-        ph = 2 * np.pi * np.cumsum(500 * (5.0 ** (tt / tt[-1]))) / SR
-        x = 0.35 * np.sin(ph) * np.sin(np.pi * tt / tt[-1]) ** 2
-        x += _sweep_noise(k, 900, 7000, 1.5, rng) * np.sin(np.pi * tt / tt[-1]) ** 3 * 0.8
-        _place(buf, x, t0, gain, pan)
-
-    def chime(t0, gain, notes):
-        k = int(2.6 * SR)
-        tt = np.arange(k) / SR
-        x = np.zeros(k)
-        for i, f in enumerate(notes):
-            d = int(i * 0.045 * SR)
-            y = (np.sin(2 * np.pi * f * tt) + 0.25 * np.sin(2 * np.pi * 2 * f * tt)) * _env(k, 0.004, 0.9)
-            x[d:] += y[:k - d]
-        _place(buf, x, t0, gain)
-
-    a, b = SHOTS["reveal"]
-    whoosh(_f2s(a) - 0.25, 1.6, 300, 5000, 0.5)
-    a3, b3 = SHOTS["inside"]
-    boom(_f2s(a3 + 12), 0.9)
-    whoosh(_f2s(a3 + 8), 1.3, 200, 2500, 0.35, 0.3, -0.3)
-    k = int(0.9 * SR)
-    tt = np.arange(k) / SR
-    rise = np.sin(2 * np.pi * np.cumsum(220 * 4 ** (tt / tt[-1])) / SR) * (0.5 + 0.5 * np.sign(np.sin(2 * np.pi * 18 * tt)))
-    _place(buf, rise * np.sin(np.pi * tt / tt[-1]), _f2s(a3 + 40), 0.12)
-    for i in range(6):
-        k = int(0.05 * SR)
-        _place(buf, np.sin(2 * np.pi * (1800 + 400 * i) * np.arange(k) / SR) * _env(k, 0.001, 0.02),
-               _f2s(a3 + 60) + 0.07 * i, 0.08, (-1) ** i * 0.5)
-    whoosh(_f2s(b3 - 30), 0.8, 4000, 400, 0.3, 0.4, -0.4)
-    boom(_f2s(b3 - 6), 0.6, 140, 60, 0.6)
-    a4, b4 = SHOTS["finish"]
-    for i, f in enumerate((a4 + 12, a4 + 42, a4 + 72, a4 + 100)):
-        zap(_f2s(f), 0.55, -0.5 + i * 0.33)
-    beat = 60.0 / 100.0
-    tb = _f2s(SHOTS["reveal"][0] + 24)
-    while tb < _f2s(SHOTS["hero"][0] + 20):
-        kick(tb, 0.32)
-        tb += beat
-    a5, b5 = SHOTS["hero"]
-    whoosh(_f2s(a5) - 0.1, 1.4, 600, 6000, 0.35, 0.6, -0.6)
-    chime(_f2s(a5 + 25), 0.16, [659.3, 830.6, 987.8, 1318.5])
-    swell = int(0.7 * SR)
-    sw = _bandpass(rng.standard_normal(swell), 1500, 12000) * np.linspace(0, 1, swell) ** 3
-    _place(buf, sw, _f2s(a5 + 44) - 0.7, 0.25)
-    boom(_f2s(a5 + 44), 1.0, 110, 36, 2.4)
-
-    # room: convolve with a short synthetic hall
-    ir_n = int(1.9 * SR)
-    ir = rng.standard_normal((2, ir_n)) * np.exp(-np.arange(ir_n) / SR / 0.42)
-    ir[:, :int(0.012 * SR)] = 0.0
-    m = 1 << int(np.ceil(np.log2(n + ir_n)))
-    wet = np.stack([np.fft.irfft(np.fft.rfft(buf[c], m) * np.fft.rfft(ir[c], m), m)[:n] for c in range(2)])
-    wet *= 0.18 * np.abs(buf).max() / max(np.abs(wet).max(), 1e-9)
-    mix = buf + wet
-    mix *= np.interp(t, [0, 0.05, dur - 0.6, dur], [0, 1, 1, 0])
-    mix /= max(np.percentile(np.abs(mix), 99.95), 1e-9)       # loudness from the body, not the spikes
-    mix = np.tanh(1.5 * mix) / np.tanh(1.5)                   # soft-clip limiter
-    mix /= max(np.abs(mix).max(), 1e-9) / 0.93
-    pcm = (np.clip(mix.T, -1, 1) * 32767).astype("<i2")
+    mixd *= np.clip((dur - t) / 0.7, 0, 1) ** 1.5
+    mixd = hp(shelf(mixd, 55, -4.0), 30, 3)               # small speakers can't use deep sub: keep headroom
+    mixd = compress(mixd, thresh_db=-20, ratio=2.0, attack=0.015, release=0.2)
+    mixd = shelf(mixd, 9000, 1.0, high=True)
+    lufs = loudness(mixd)
+    mixd *= 10 ** ((-14.0 - lufs) / 20)
+    mixd = limit(mixd, -1.6)
+    mixd = limit(mixd, -1.6, look=0.002, release=0.05)
+    lufs = loudness(mixd)                                  # the limiter shaved the peaks: land on target
+    mixd *= 10 ** (min(2.5, -14.0 - lufs) / 20)
+    mixd = limit(mixd, -1.6)
+    mixd = limit(mixd, -1.6, look=0.002, release=0.05)
+    peak_db = true_peak(mixd)
+    if peak_db > -1.0:
+        mixd *= 10 ** ((-1.0 - peak_db) / 20)
+    pcm = (np.clip(mixd.T, -1, 1) * 32767).astype("<i2")
     with wave.open(path, "wb") as w:
         w.setnchannels(2)
         w.setsampwidth(2)
         w.setframerate(SR)
         w.writeframes(pcm.tobytes())
-    log(f"soundtrack: {path} ({dur:.1f}s)")
+    log(f"soundtrack: {path} ({dur:.1f}s, {loudness(mixd):.1f} LUFS, true peak {true_peak(mixd):.1f} dBTP)")
     return path
 
 
