@@ -55,9 +55,32 @@ The ideas I added beyond a plain turntable:
   the screen waking, and the tagline *Let the light in.*
 - **Colour change as a physical event.** Instead of a cross-fade, a glowing scan line "re-anodises"
   the aluminium, back glass and lens rings in one pass, using a single shared shader group.
-- **Procedural sound design.** A pad, metallic iris ticks, whooshes, sub hits, scan "zaps", a wake
-  chime and a final hit, all synthesised in numpy and convolved with a generated room, then muxed in
-  by Blender's own FFmpeg.
+- **A scored soundtrack, cut to the picture.** At 96 BPM a bar is 2.5 s, so from the reveal on every
+  shot is exactly two bars and each cut lands on a downbeat. Everything is synthesised in numpy (see
+  *Sound* below) and muxed in by Blender's own FFmpeg.
+
+## Sound
+
+| Time | Music | Sound effects |
+|---|---|---|
+| 0–4.5 s | low drone | Three lens clicks, each a servo whine, a mechanical tick and a bell tuned up the A-minor triad (A5, C6, E6). A riser into the cut |
+| 4.5–9.5 s | Pad Am(add9) → Fmaj7, plucked arpeggio with a dotted-eighth ping-pong delay, half-time kick, snare roll | Whoosh and sub on the reveal. A riser into the drop |
+| 9.5–14.5 s | C(add9) → G6, full beat, pad pumping against the kick, mid + sub bass | Impact on the explode (sub drop, crack, metallic shing), chip power-up and data blips, airflow. A reversed hit swells into a latch click on the snap-back |
+| 14.5–19.5 s | Am(add9) → Fmaj7 with claps | A laser scan per finish, each ending on a bell tuned to the chord |
+| 19.5–24 s | Breakdown on Gsus4, then a resolve to C(add9) on the title | Spin whoosh, wake chime (C6-G6-E7), riser and reverse cymbal, final hit |
+
+How it's built:
+
+- **Mostly band-limited synthesis.** PolyBLEP saws and FM bells and plucks. Filters are smooth
+  Butterworth-shaped curves rather than brick-wall masks, so they don't ring.
+- **Mixed on buses.** A stereo convolution hall and plate with early reflections, the music
+  sidechained to the kick, and everything ducked under the two big hits.
+- **Mastered.** Sub shelf and high-pass, glue compression, a look-ahead limiter, then about −15 LUFS
+  integrated at −1 dBTP.
+- **Checked by measurement, not ear.** No clipping and no click artifacts, mono-safe (L/R correlation
+  0.73). A spectrogram with the picture's events marked confirms each sound lands on its frame.
+
+`blender -b -P iphone18_ad.py -- --audio sound.wav` writes just the soundtrack (about 10 s).
 
 ## Usage
 
