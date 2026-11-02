@@ -205,7 +205,7 @@ TORSO = [
     (1.196, 0.000, 0.118, 0.080, 0.075, 0.004, 2.2),   # T6 armpit (bottom of arm socket)
     (1.254, 0.000, 0.124, 0.071, 0.074, 0.004, 2.2),   # T7 mid socket
 ]
-TW, TD = 4, 3                    # torso cage box: 4 faces across, 3 deep -> 14 around
+TW, TD = 4, 2                    # torso cage box: 4 faces across, 2 deep -> 12 around (24 final)
 TN = 2 * TW + 2 * TD
 
 SHOULDER = V((0.150, 0.004, 1.266))      # left shoulder joint
@@ -446,109 +446,94 @@ def torso_ring_points(spec):
 
 def build_torso(cage):
     idx_of = {ij: m for m, ij in enumerate(rect_boundary(TW, TD))}
+    F_C, F_L, F_R = idx_of[(2, 0)], idx_of[(3, 0)], idx_of[(1, 0)]       # front centre / beside it
+    B_C, B_L, B_R = idx_of[(2, TD)], idx_of[(3, TD)], idx_of[(1, TD)]    # back centre / beside it
     rings = []
     for k, spec in enumerate(TORSO):
         pts = torso_ring_points(spec)
         if k == 1:          # glutes
-            for m in (8, 10):
-                pts[m].y += 0.016
+            for m in (B_L, B_R):
+                pts[m].y += 0.020
                 pts[m].z -= 0.010
-            pts[9].y += 0.006
+            pts[B_C].y += 0.008
         if k == 0:
-            for m in (8, 10):
-                pts[m].y += 0.008
+            for m in (B_L, B_R):
+                pts[m].y += 0.010
         if k == 5:          # bust
-            for m in (1, 3):
-                pts[m].y -= 0.030
+            for m in (F_L, F_R):
+                pts[m].y -= 0.032
                 pts[m].z += 0.004
-            pts[2].y -= 0.014
+            pts[F_C].y -= 0.016
         if k == 6:          # upper chest and armpit hollow
-            for m in (1, 3):
-                pts[m].y -= 0.010
-            pts[2].y -= 0.004
+            for m in (F_L, F_R):
+                pts[m].y -= 0.012
+            pts[F_C].y -= 0.006
         if k == 4:
-            for m in (1, 3):
-                pts[m].y -= 0.004
+            for m in (F_L, F_R):
+                pts[m].y -= 0.006
         rings.append(pts)
 
     # T8: the shoulder line (explicit, left half; mirrored)
     sh = {
         (2, 0): (0.000, -0.046, 1.300),   # jugular notch
-        (3, 0): (0.044, -0.042, 1.312),
-        (4, 0): (0.118, -0.036, 1.300),   # front of shoulder
-        (4, 1): (0.160, -0.014, 1.302),   # top of shoulder
-        (4, 2): (0.160, 0.022, 1.302),
-        (4, 3): (0.118, 0.050, 1.300),    # back of shoulder
-        (3, 3): (0.044, 0.060, 1.330),
-        (2, 3): (0.000, 0.064, 1.336),    # C7
+        (3, 0): (0.050, -0.042, 1.312),
+        (4, 0): (0.124, -0.034, 1.302),   # front of shoulder
+        (4, 1): (0.164, 0.004, 1.306),    # top of shoulder
+        (4, 2): (0.124, 0.048, 1.302),    # back of shoulder
+        (3, 2): (0.050, 0.060, 1.332),
+        (2, 2): (0.000, 0.064, 1.336),    # C7
     }
     t8 = []
     for (i, j) in rect_boundary(TW, TD):
-        if i >= 2:
-            t8.append(V(sh[(i, j)]))
-        else:
-            p = V(sh[(TW - i, j)])
+        p = V(sh[(i, j)] if i >= 2 else sh[(TW - i, j)])
+        if i < 2:
             p.x = -p.x
-            t8.append(p)
+        t8.append(p)
     rings.append(t8)
 
     # create vertices; T7 has no vertices on the sides (the arm sockets live there)
-    side_mid = {idx_of[(TW, 1)], idx_of[(TW, 2)], idx_of[(0, 1)], idx_of[(0, 2)]}
+    side_mid = {idx_of[(TW, j)] for j in range(1, TD)} | {idx_of[(0, j)] for j in range(1, TD)}
+    left_side = {idx_of[(TW, j)] for j in range(TD + 1)}
+    right_side = {idx_of[(0, j)] for j in range(TD + 1)}
     T = []
     for k, pts in enumerate(rings):
-        ring = []
-        for m, p in enumerate(pts):
-            if k == 7 and m in side_mid:
-                ring.append(None)
-            else:
-                ring.append(cage.v(p, "torso"))
-        T.append(ring)
-
+        T.append([None if (k == 7 and m in side_mid) else cage.v(p, "torso") for m, p in enumerate(pts)])
     for k in range(len(T) - 1):
         A, B = T[k], T[k + 1]
         for m in range(TN):
             m2 = (m + 1) % TN
             if None in (A[m], A[m2], B[m], B[m2]):
                 continue
-            # the arm socket: side faces between T6..T8
-            if k in (6, 7):
-                if {m, m2} <= set(range(4, 8)) or {m, m2} <= {11, 12, 13, 0}:
-                    continue
+            if k in (6, 7) and ({m, m2} <= left_side or {m, m2} <= right_side):
+                continue                                            # the arm sockets
             cage.quad(A[m], A[m2], B[m2], B[m])
 
-    # top cap: shoulder strips + neck opening
-    T8 = T[8]
-    g = {ij: T8[m] for ij, m in idx_of.items()}
-    for (i, j), p in {(3, 1): (0.046, -0.010, 1.344), (3, 2): (0.046, 0.030, 1.350)}.items():
-        g[(i, j)] = cage.v(p, "torso")
-        g[(TW - i, j)] = cage.v((-p[0], p[1], p[2]), "torso")
+    # top cap: a strip over each shoulder + the neck opening (8 around)
+    g = {ij: T[8][m] for ij, m in idx_of.items()}
+    p = (0.048, 0.010, 1.348)
+    g[(3, 1)] = cage.v(p, "torso")
+    g[(1, 1)] = cage.v((-p[0], p[1], p[2]), "torso")
     for j in range(TD):
         cage.quad(g[(0, j + 1)], g[(1, j + 1)], g[(1, j)], g[(0, j)])
         cage.quad(g[(3, j)], g[(4, j)], g[(4, j + 1)], g[(3, j + 1)])
-    neck_loop = [g[(1, 0)], g[(2, 0)], g[(3, 0)], g[(3, 1)], g[(3, 2)], g[(3, 3)],
-                 g[(2, 3)], g[(1, 3)], g[(1, 2)], g[(1, 1)]]
+    neck_loop = [g[(1, 0)], g[(2, 0)], g[(3, 0)], g[(3, 1)], g[(3, 2)], g[(2, 2)], g[(1, 2)], g[(1, 1)]]
 
-    # arm sockets (10-vertex loops)
-    def socket(i_side):
-        ms = [idx_of[(i_side, j)] for j in range(TD + 1)]       # front -> back
-        loop = [T[6][m] for m in ms] + [T[7][ms[-1]]] + [T[8][m] for m in reversed(ms)] + [T[7][ms[0]]]
-        return loop
+    def socket(i_side):                                             # 8-vertex arm socket
+        ms = [idx_of[(i_side, j)] for j in range(TD + 1)]           # front -> back
+        return [T[6][m] for m in ms] + [T[7][ms[-1]]] + [T[8][m] for m in reversed(ms)] + [T[7][ms[0]]]
 
     sockets = {1: socket(TW), -1: socket(0)}
 
-    # leg openings at the bottom: a crotch line with a diamond quad at its front and back
-    # end, so no vertex in the groin has more than five edges
-    T0 = T[0]
-    gb = {ij: T0[m] for ij, m in idx_of.items()}
-    crotch = [cage.v(p, "torso") for p in ((0.0, -0.040, 0.750), (0.0, -0.014, 0.741),
-                                            (0.0, 0.014, 0.741), (0.0, 0.044, 0.752))]
+    # leg openings: a crotch line with a diamond quad at its front and back end, so no vertex
+    # in the groin has more than five edges
+    gb = {ij: T[0][m] for ij, m in idx_of.items()}
+    crotch = [cage.v(q, "torso") for q in ((0.0, -0.036, 0.749), (0.0, 0.002, 0.740), (0.0, 0.040, 0.751))]
     cage.quad(gb[(1, 0)], crotch[0], gb[(3, 0)], gb[(2, 0)])
-    cage.quad(gb[(3, 3)], crotch[3], gb[(1, 3)], gb[(2, 3)])
+    cage.quad(gb[(3, 2)], crotch[2], gb[(1, 2)], gb[(2, 2)])
     legs = {
-        -1: [gb[(0, 0)], gb[(1, 0)]] + crotch + [gb[(1, 3)], gb[(0, 3)], gb[(0, 2)], gb[(0, 1)]],
-        1: [gb[(3, 0)], gb[(4, 0)], gb[(4, 1)], gb[(4, 2)], gb[(4, 3)], gb[(3, 3)]] + crotch[::-1],
+        -1: [gb[(0, 0)], gb[(1, 0)]] + crotch + [gb[(1, 2)], gb[(0, 2)], gb[(0, 1)]],
+        1: [gb[(3, 0)], gb[(4, 0)], gb[(4, 1)], gb[(4, 2)], gb[(3, 2)]] + crotch[::-1],
     }
-    # seams: down the back of the torso is avoided; we cut along the sides instead later
     return {"rings": T, "neck": neck_loop, "sockets": sockets, "legs": legs, "idx_of": idx_of}
 
 
@@ -643,39 +628,23 @@ def build_arm(cage, side, socket):
     socket = orient_ccw(cage, socket, sock_center, u_fwd, u_up)
     phi_sock = phis_of([cage.co[i] for i in socket], sock_center, u_fwd, u_up)
     phi_uni = uniform_phis_like(phi_sock)
-    # hand layout angles, matched to the uniform angles by a cyclic shift
-    hand_phi = [math.atan2(b, a * 1.6) for a, b in HAND_LAYOUT]
-    best = None
-    for s in range(10):
-        err = sum(angle_wrap(hand_phi[(k + s) % 10] - phi_uni[k]) ** 2 for k in range(10))
-        if best is None or err < best[0]:
-            best = (err, s)
-    shift = best[1]
-    hand_pts = [HAND_LAYOUT[(k + shift) % 10] for k in range(10)]
-
     prev = socket
     rings = []
     for n, (t, r1, r2, hb) in enumerate(ARM_RINGS):
         c, d = polyline_point(path, t)
         uf, uu = frame_at(d, side)
-        blend = smoothstep(0.0, 0.10, t - 0.01)
-        phis = blend_phis(phi_sock, phi_uni, blend)
-        pts2d = []
-        for k in range(10):
-            ca, sa = math.cos(phis[k]), math.sin(phis[k])
-            ha, hb2 = hand_pts[k][0] * 0.92, hand_pts[k][1] * 0.92
-            pts2d.append((lerp(ca, ha, hb), lerp(sa, hb2, hb)))
+        phis = blend_phis(phi_sock, phi_uni, smoothstep(0.0, 0.10, t - 0.01))
+        pts2d = [(math.cos(p), math.sin(p)) for p in phis]
         pts = ring_frame_points(c, uf, uu, pts2d, r1, r2)
         if n == 4:                              # elbow point sticks out at the back
-            for k in range(10):
+            for k in range(len(pts)):
                 if pts2d[k][0] < -0.7:
                     pts[k] += (-uf) * 0.003
         ring = cage.ring(pts, "arm")
         cage.bridge(prev, ring)
         prev = ring
         rings.append(ring)
-    wrist_ring = prev
-    hand = build_hand(cage, side, wrist_ring, Wr, (Wr - E).normalized(), shift)
+    hand = build_hand(cage, side, prev, Wr, (Wr - E).normalized())
     return {"rings": rings, "S": S, "E": E, "W": Wr, "hand": hand}
 
 
@@ -690,12 +659,20 @@ FINGERS = {
 FINGER_ORDER = ["index", "middle", "ring", "pinky"]
 
 
-def build_hand(cage, side, wrist_ring, W, d_arm, shift):
+def build_hand(cage, side, wrist_ring, W, d_arm):
     # hand frame: continue the forearm, tipped slightly toward the palm
     uf0, uu0 = frame_at(d_arm, side)
     d = (d_arm - uu0 * 0.12).normalized()
     uf, uu = frame_at(d, side)
-    hand_layout = [HAND_LAYOUT[(k + shift) % 10] for k in range(10)]
+    # the 8-vertex wrist widens into the 10-vertex palm with one 1->3 cell on the pinky side
+    nw = len(wrist_ring)
+    wc = sum((cage.co[i] for i in wrist_ring), V()) / nw
+    mids = [(cage.co[wrist_ring[c]] + cage.co[wrist_ring[(c + 1) % nw]]) / 2 for c in range(nw)]
+    cu = min(range(nw), key=lambda c: (mids[c] - wc).dot(uf))
+    splits = [3 if c == cu else 1 for c in range(nw)]
+    starts = [sum(splits[:c]) for c in range(nw)]
+    m = starts[cu]
+    hand_layout = [HAND_LAYOUT[(j - (m + 1) + 4) % 10] for j in range(10)]
     # palm rings: (distance from wrist, half width, half thickness, knuckle curve)
     palm = [(0.020, 0.0275, 0.0135), (0.050, 0.0315, 0.0125), (0.082, 0.0330, 0.0105)]
     prev = wrist_ring
@@ -711,7 +688,10 @@ def build_hand(cage, side, wrist_ring, W, d_arm, shift):
                 p += uf * 0.003 - uu * 0.003
             pts.append(p)
         ring = cage.ring(pts, "hand")
-        cage.bridge(prev, ring, skip=())
+        if n == 0:
+            transition_strip(cage, wrist_ring, ring, lambda c: splits[c], lambda c: starts[c], True, "hand")
+        else:
+            cage.bridge(prev, ring)
         prev = ring
         palm_rings.append(ring)
 
@@ -905,7 +885,7 @@ def build_foot(cage, side, ankle_ring):
         cx = cx0 + side * xo
         ring = []
         for (ix, iz) in FOOT_RING:
-            if n in (2, 3) and (ix, iz) == (1, 2):
+            if n == 2 and (ix, iz) == (1, 2):
                 ring.append(None)      # inside the ankle opening
                 continue
             sx = (ix - 1)
@@ -930,7 +910,7 @@ def build_foot(cage, side, ankle_ring):
             if None in (A[k], A[k2], B[k], B[k2]):
                 continue
             # skip the top faces that form the ankle opening (rings 1..4, top row)
-            if 1 <= n <= 3 and FOOT_RING[k][1] == 2 and FOOT_RING[k2][1] == 2:
+            if 1 <= n <= 2 and FOOT_RING[k][1] == 2 and FOOT_RING[k2][1] == 2:
                 continue
             cage.quad(A[k], A[k2], B[k2], B[k])
     # caps (2x2 grids with a centre vertex)
@@ -952,153 +932,227 @@ def build_foot(cage, side, ankle_ring):
             cage.creases[cage.edge_key(fr[n][k], fr[n + 1][k])] = 0.85
     # ankle opening loop
     pos = [{ij: fr[n][k] for k, ij in enumerate(FOOT_RING)} for n in range(len(fr))]
-    opening = [pos[1][(0, 2)], pos[1][(1, 2)], pos[1][(2, 2)], pos[2][(2, 2)], pos[3][(2, 2)],
-               pos[4][(2, 2)], pos[4][(1, 2)], pos[4][(0, 2)], pos[3][(0, 2)], pos[2][(0, 2)]]
+    opening = [pos[1][(0, 2)], pos[1][(1, 2)], pos[1][(2, 2)], pos[2][(2, 2)],
+               pos[3][(2, 2)], pos[3][(1, 2)], pos[3][(0, 2)], pos[2][(0, 2)]]
     cage.bridge_aligned(ankle_ring, opening)
     return {"rings": fr}
 
 
 # ---------------------------------------------------------------------------- neck + head
-# The head cage is a box (10 faces across, 6 deep, 12 rows of walls) projected onto the head
-# SDF. Front wall columns:  1 | 3 right eye | 2 | 3 left eye | 1   -> 20-vertex eye rims after
-# subdivision. Eye and mouth patches get two inset rings (concentric loops), the ears grow out
-# of 2x2 sockets on the side walls, and the neck plugs into a 2x3 hole in the bottom.
-HW, HD, HK = 10, 6, 12
-HX = [-1.0, -0.86, -0.66, -0.44, -0.22, 0.0, 0.22, 0.44, 0.66, 0.86, 1.0]
-HY = [-1.0, -0.62, -0.22, 0.14, 0.48, 0.78, 1.0]
-HZ = [-1.0, -0.84, -0.70, -0.58, -0.46, -0.34, -0.22, -0.10, 0.02, 0.15, 0.32, 0.58, 1.0]
-HSCALE = V((0.95, 0.75, 0.62))
+# Head topology, laid out the way anime heads are retopologised:
+#  * the face is a POLAR grid around the mouth: the lip loops grow outward into the muzzle,
+#    pass under the nose, around the nose bridge and cheeks, over the brow and out to the
+#    hairline / jaw. Rings 0-3 have 16 spokes (lips), rings 4-9 have 24: four 1->3 transition
+#    cells between ring 3 and 4 put the poles in the nasolabial / jaw area, like a real face;
+#  * each eye replaces a 3x2-cell block of the outer grid and gets two inset rings, so the lid
+#    rim has 20 vertices and its loops flow into the face loops around it;
+#  * a HOOD covers the cranium: its rows arc from temple to temple over the head, its columns
+#    run from the hairline to the base of the skull; it widens from 6 to 10 columns just behind
+#    the hairline and narrows back at the nape (poles under the hair). The ears grow from 1x2
+#    sockets in it;
+#  * the neck plugs into an 8-vertex ring: the throat (bottom of the face outline) plus the
+#    bottom edge of the hood.
 
-EYE_PATCH = {-1: (1, 4, 7, 9), 1: (6, 9, 7, 9)}     # (i0, i1, k0, k1) on the front wall
-MOUTH_PATCH = (4, 6, 2, 4)
-NOSE_IK = (5, 5)
-EAR_PATCH = (2, 4, 6, 8)                            # (j0, j1, k0, k1) on both side walls
-NECK_HOLE = [(4, 2), (5, 2), (6, 2), (6, 3), (6, 4), (6, 5), (5, 5), (4, 5), (4, 4), (4, 3)]
+
+def _full(half):
+    return half + [-a for a in reversed(half[1:-1])]
+
+
+IN_SPOKES = [0, 20, 42, 66, 90, 114, 138, 160, 180]                   # left half, degrees from "up"
+OUT_SPOKES = [0, 14, 26, 38, 50, 68, 90, 110, 126, 142, 157, 169, 180]
+SP_IN, SP_OUT = _full(IN_SPOKES), _full(OUT_SPOKES)                    # 16 and 24 spokes
+N_IN, N_OUT = len(SP_IN), len(SP_OUT)
+CELL_SPLIT = [1, 3, 1, 1, 1, 3, 1, 1]                                 # inner half-cells -> outer cells
+_HALF_MAP = [0]
+for _n in CELL_SPLIT:
+    _HALF_MAP.append(_HALF_MAP[-1] + _n)                               # inner half index -> outer half index
+
+
+def in_to_out(k):
+    return _HALF_MAP[k] if k <= N_IN // 2 else N_OUT - _HALF_MAP[N_IN - k]
+
+
+NRING = 10
+RING_FRAC = [0.0, 0.05, 0.11, 0.19, 0.29, 0.40, 0.52, 0.64, 0.80, 1.0]
+EYE_BLOCK = {1: (1, 4), -1: (20, 23)}       # outer spoke range of each eye block (rings 5..7)
+EYE_RINGS = (5, 7)
+HOOD_TOP = [3, 2, 1, 0, 23, 22, 21]         # ring-9 spokes along the hairline (P_L ... P_R)
+HOOD_ROWS = 8                               # rows from the hairline to the nape
+HOOD_COLS = 10                              # columns in the middle rows
+HOOD_SPLIT = [1, 3, 1, 1, 3, 1]             # 6 hairline cells -> 10 columns
 EAR_C = V((0.0, 0.011, 1.446))
+# ring 9 on the left half, spokes 0..9: hairline -> temple -> in front of the ear -> jaw angle
+# (projected onto the head). Spokes 10..12 are the throat, on the neck.
+R9_GUIDE = [(0.000, -0.070, 1.530), (0.022, -0.068, 1.528), (0.040, -0.062, 1.522),
+            (0.055, -0.052, 1.512), (0.067, -0.040, 1.498), (0.076, -0.024, 1.475),
+            (0.078, -0.008, 1.440), (0.066, 0.003, 1.408), (0.056, 0.006, 1.396),
+            (0.046, 0.007, 1.388), (0.038, 0.000, 1.383)]
+R9_NECK_ALPHA = {11: 45, 12: 0}
 
 
-def head_dir(i, j, k):
-    return V((HX[i] * HSCALE.x, HY[j] * HSCALE.y, HZ[k] * HSCALE.z)).normalized()
+def neck_ring_point(alpha_deg):
+    a = math.radians(alpha_deg)
+    dv = V((math.sin(a), -math.cos(a), 0.0))
+    z = lerp(1.380, 1.405, smoothstep(-0.9, 0.9, dv.y))
+    ay = lerp(0.026, 0.016, (z - 1.29) / 0.14)
+    return V((dv.x * 0.0362, ay + dv.y * 0.0362, z))
 
 
-def patch_loop(coord, a0, a1, k0, k1):
-    """Boundary of a patch on a wall; coord(a, k) -> vertex key."""
-    keys = ([coord(a, k0) for a in range(a0, a1 + 1)] + [coord(a1, k) for k in range(k0 + 1, k1 + 1)]
-            + [coord(a, k1) for a in range(a1 - 1, a0 - 1, -1)] + [coord(a0, k) for k in range(k1 - 1, k0, -1)])
-    return keys
+def head_point(direction):
+    return project_ray(HEAD_C, V(direction), head_proj_sdf)
+
+
+def slerp_dir(a, b, t):
+    a, b = a.normalized(), b.normalized()
+    om = math.acos(clamp(a.dot(b), -1.0, 1.0))
+    if om < 1e-6:
+        return a
+    return (a * math.sin((1 - t) * om) + b * math.sin(t * om)) / math.sin(om)
+
+
+def mouth_ring_point(theta_deg, sx, hz_top, hz_bot, inset=0.0):
+    th = math.radians(theta_deg)
+    x = MOUTH_HALF_W * sx * math.sin(th)
+    c = math.cos(th)
+    z = MOUTH_C.z + (hz_top * c if c > 0 else hz_bot * c)
+    return project_front(x, z, head_sdf) + V((0, inset, 0))
+
+
+def transition_strip(cage, inner, outer, split, mapping, closed, group="head"):
+    """Quads between a row `inner` and a longer row `outer`. Each inner cell becomes 1 outer
+    cell, or 3 (the 1->3 pattern: two interior vertices, four quads)."""
+    n = len(inner) if closed else len(inner) - 1
+    for c in range(n):
+        a, b = inner[c], inner[(c + 1) % len(inner)]
+        A = mapping(c)
+        if split(c) == 1:
+            cage.quad(a, b, outer[(A + 1) % len(outer)], outer[A])
+            continue
+        o = [outer[(A + j) % len(outer)] for j in range(4)]
+        pa, pb = cage.co[a], cage.co[b]
+        xa = cage.v(pa.lerp(cage.co[o[1]], 0.5), group)
+        xb = cage.v(pb.lerp(cage.co[o[2]], 0.5), group)
+        cage.quad(o[0], o[1], xa, a)
+        cage.quad(a, xa, xb, b)
+        cage.quad(b, xb, o[2], o[3])
+        cage.quad(o[1], o[2], xb, xa)
 
 
 def build_head(cage):
-    skip = {(5, 3, 0), (5, 4, 0)}
-    for (i0, i1, k0, k1) in list(EYE_PATCH.values()) + [MOUTH_PATCH]:
-        skip.update((i, 0, k) for i in range(i0 + 1, i1) for k in range(k0 + 1, k1))
-    j0, j1, ek0, ek1 = EAR_PATCH
-    for i_s in (0, HW):
-        skip.update((i_s, j, k) for j in range(j0 + 1, j1) for k in range(ek0 + 1, ek1))
-    verts = {}
-    for i in range(HW + 1):
-        for j in range(HD + 1):
-            for k in range(HK + 1):
-                if not (i in (0, HW) or j in (0, HD) or k in (0, HK)) or (i, j, k) in skip:
-                    continue
-                p = project_ray(HEAD_C, head_dir(i, j, k), head_proj_sdf)
-                grp = "neckring" if (k == 0 and (i, j) in NECK_HOLE) else "head"
-                verts[(i, j, k)] = cage.v(p, grp)
-
-    def q(a, b, c, d):
-        cage.quad(verts[a], verts[b], verts[c], verts[d])
-
-    def in_front_patch(i, k):
-        return any(i0 <= i < i1 and k0 <= k < k1
-                   for (i0, i1, k0, k1) in list(EYE_PATCH.values()) + [MOUTH_PATCH])
-
-    for i in range(HW):
-        for j in range(HD):
-            if not (4 <= i <= 5 and 2 <= j <= 4):
-                q((i, j, 0), (i, j + 1, 0), (i + 1, j + 1, 0), (i + 1, j, 0))
-            q((i, j, HK), (i + 1, j, HK), (i + 1, j + 1, HK), (i, j + 1, HK))
-    for i in range(HW):
-        for k in range(HK):
-            q((i, HD, k), (i, HD, k + 1), (i + 1, HD, k + 1), (i + 1, HD, k))
-            if not in_front_patch(i, k):
-                q((i, 0, k), (i + 1, 0, k), (i + 1, 0, k + 1), (i, 0, k + 1))
-    for j in range(HD):
-        for k in range(HK):
-            if j0 <= j < j1 and ek0 <= k < ek1:
+    pos_in, pos_out = {}, {}
+    for k, th in enumerate(SP_IN):                    # lips and the loops around them (pinned)
+        pos_in[0, k] = mouth_ring_point(th, 1.0, 0.0004, 0.0004, inset=0.0015)
+        pos_in[1, k] = mouth_ring_point(th, 1.45, 0.0065, 0.0065)
+        pos_in[2, k] = mouth_ring_point(th, 2.05, 0.0115, 0.0125)
+    for K in range(N_OUT):                            # face outline / throat
+        side = 1 if 0 < K < N_OUT // 2 else -1 if K > N_OUT // 2 else 0
+        kk = K if K <= N_OUT // 2 else N_OUT - K
+        if kk in R9_NECK_ALPHA:
+            pos_out[9, K] = neck_ring_point(R9_NECK_ALPHA[kk] * (side or 1))
+        else:
+            g = V(R9_GUIDE[kk])
+            g.x *= side
+            pos_out[9, K] = head_point(g - HEAD_C)
+    # ring 3 (inner) and rings 4-8 (outer): interpolate along the spokes, ring 2 -> ring 9
+    t_of = lambda r: (RING_FRAC[r] - RING_FRAC[2]) / (1.0 - RING_FRAC[2])
+    for k in range(N_IN):
+        pos_in[3, k] = head_point(slerp_dir(pos_in[2, k] - HEAD_C, pos_out[9, in_to_out(k)] - HEAD_C, t_of(3)))
+    for K, th in enumerate(SP_OUT):
+        d2 = mouth_ring_point(th, 2.05, 0.0115, 0.0125) - HEAD_C
+        for r in range(4, 9):
+            pos_out[r, K] = head_point(slerp_dir(d2, pos_out[9, K] - HEAD_C, t_of(r)))
+    pos_in[3, 0] = project_front(0.0, NOSE_Z, head_sdf)                # nose tip
+    skip = set()
+    for (K0, K1) in EYE_BLOCK.values():
+        skip.update((6, K) for K in range(K0 + 1, K1))
+    Fi = [[cage.v(pos_in[r, k], "head") for k in range(N_IN)] for r in range(4)]
+    Fo = {}
+    for r in range(4, NRING):
+        for K in range(N_OUT):
+            if (r, K) in skip:
                 continue
-            q((0, j, k), (0, j, k + 1), (0, j + 1, k + 1), (0, j + 1, k))
-            q((HW, j, k), (HW, j + 1, k), (HW, j + 1, k + 1), (HW, j, k + 1))
+            grp = "neckring" if (r == 9 and abs(K - N_OUT // 2) <= 1) else "head"
+            Fo[r, K] = cage.v(pos_out[r, K], grp)
+    F9 = [Fo[9, K] for K in range(N_OUT)]
+    for r in range(3):
+        cage.bridge(Fi[r], Fi[r + 1])
+    split_in = lambda c: CELL_SPLIT[c] if c < N_IN // 2 else CELL_SPLIT[N_IN - 1 - c]
+    transition_strip(cage, Fi[3], [Fo[4, K] for K in range(N_OUT)], split_in, in_to_out, True)
+    for r in range(4, NRING - 1):
+        for K in range(N_OUT):
+            K2 = (K + 1) % N_OUT
+            if EYE_RINGS[0] <= r < EYE_RINGS[1] and any(K0 <= K < K1 for (K0, K1) in EYE_BLOCK.values()):
+                continue
+            cage.quad(Fo[r, K], Fo[r, K2], Fo[r + 1, K2], Fo[r + 1, K])
 
-    feats = {"hole": [verts[(i, j, 0)] for (i, j) in NECK_HOLE],
-             "nose": verts[(NOSE_IK[0], 0, NOSE_IK[1])]}
-    for side, (i0, i1, k0, k1) in EYE_PATCH.items():
-        feats["eye", side] = [verts[(i, 0, k)] for (i, k) in patch_loop(lambda a, k: (a, k), i0, i1, k0, k1)]
-    i0, i1, k0, k1 = MOUTH_PATCH
-    feats["mouth"] = [verts[(i, 0, k)] for (i, k) in patch_loop(lambda a, k: (a, k), i0, i1, k0, k1)]
-    for side, i_s in ((-1, 0), (1, HW)):
-        keys = patch_loop(lambda a, k: (a, k), j0, j1, ek0, ek1)
-        feats["ear", side] = ([verts[(i_s, j, k)] for (j, k) in keys], keys)
+    # the hood over the cranium
+    nside = HOOD_ROWS
+    left = [F9[3 + w] for w in range(nside + 1)]                      # P_L ... E_L
+    right = [F9[21 - w] for w in range(nside + 1)]                    # P_R ... E_R
+    rows = [[F9[K] for K in HOOD_TOP]]
+    for w in range(1, nside):
+        beta = math.radians(lerp(36.0, 240.0, w / nside))             # the centre column
+        dc = V((0.0, -math.cos(beta), math.sin(beta)))
+        dl, dr = cage.co[left[w]] - HEAD_C, cage.co[right[w]] - HEAD_C
+        half = HOOD_COLS // 2
+        row = [left[w]]
+        for u in range(1, HOOD_COLS):
+            d = slerp_dir(dl, dc, u / half) if u <= half else slerp_dir(dc, dr, (u - half) / half)
+            row.append(cage.v(head_point(d), "head"))
+        row.append(right[w])
+        rows.append(row)
+    rows.append([left[nside]] + [cage.v(neck_ring_point(a), "neckring") for a in (90, 135, 180, -135, -90)]
+                + [right[nside]])
+    hmap = [0]
+    for n_ in HOOD_SPLIT:
+        hmap.append(hmap[-1] + n_)
+    transition_strip(cage, rows[0], rows[1], lambda c: HOOD_SPLIT[c], lambda c: hmap[c], False)
+    ear_cells = {(2, 1), (3, 1), (2, HOOD_COLS - 2), (3, HOOD_COLS - 2)}
+    for w in range(1, nside - 1):
+        for u in range(HOOD_COLS):
+            if (w, u) in ear_cells:
+                continue
+            cage.quad(rows[w][u], rows[w][u + 1], rows[w + 1][u + 1], rows[w + 1][u])
+    transition_strip(cage, rows[nside], rows[nside - 1], lambda c: HOOD_SPLIT[c], lambda c: hmap[c], False)
+
+    nape = rows[nside]
+    feats = {"nose": Fi[3][0],
+             "hole": [F9[11], F9[12], F9[13]] + list(reversed(nape[1:-1])),
+             "mouth_rings": Fi[:3],
+             "outline": [F9[K] for K in range(N_OUT) if abs(K - N_OUT // 2) > 1]}
+    for side, (K0, K1) in EYE_BLOCK.items():
+        ks = list(range(K0, K1 + 1)) if side > 0 else list(range(K1, K0 - 1, -1))   # inner -> outer
+        r0, r1 = EYE_RINGS
+        rm = (r0 + r1) // 2
+        feats["eye", side] = ([Fo[rm, ks[0]]] + [Fo[r1, K] for K in ks] + [Fo[rm, ks[-1]]]
+                              + [Fo[r0, K] for K in reversed(ks)])
+    for side in (1, -1):
+        u0 = 1 if side > 0 else HOOD_COLS - 1
+        u1 = u0 + 1 if side > 0 else u0 - 1
+        # front-top, back-top, back-middle, back-bottom, front-bottom, front-middle
+        loop = [rows[2][u0], rows[2][u1], rows[3][u1], rows[4][u1], rows[4][u0], rows[3][u0]]
+        feats["ear", side] = (loop, [(-1, 1), (1, 1), (1, 0), (1, -1), (-1, -1), (-1, 0)])
     return feats
-
-
-def place_neck_hole(cage, feats):
-    """The head's neck opening: an explicit ring on the neck just under the jaw."""
-    for i_v, (i, j) in zip(feats["hole"], NECK_HOLE):
-        u, v = (i - 5) / 1.0, (j - 3.5) / 1.5
-        dv = V((u, v, 0)).normalized()
-        if abs(u) > 0.5 and abs(v) > 0.5:
-            dv = V((u * 0.8, v, 0)).normalized()
-        z = lerp(1.380, 1.405, smoothstep(-0.9, 0.9, dv.y))
-        ay = lerp(0.026, 0.016, (z - 1.29) / 0.14)
-        cage.co[i_v] = V((dv.x * 0.0362, ay + dv.y * 0.0362, z))
 
 
 EYE_RING_SCALE = [(1.72, 1.95, 0.0015, 0.0008), (1.32, 1.40, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0)]
 
 
-def eye_slot_order(side, rim):
-    """Patch loop slots: bottom row (-X..+X), +X side, top row (+X..-X), -X side.
-    Right eye: -X is the outer side.  Left eye: -X is the inner side."""
-    n = len(rim) // 2           # rim: inner, top..., outer, bottom... (outer -> inner)
-    top = rim[1:n]
-    bot = rim[n + 1:]
-    if side < 0:
-        return list(bot) + [rim[0]] + list(top) + [rim[n]]
-    return list(reversed(bot)) + [rim[n]] + list(reversed(top)) + [rim[0]]
-
-
 def place_head_features(cage, feats):
-    rim = eye_curve(5)
+    rim = eye_curve(5)                       # inner, top x4, outer, bottom x4 (outer -> inner)
     for side in (-1, 1):
-        order = eye_slot_order(side, rim)
         rings = []
         for (su, sv, du, dv) in EYE_RING_SCALE:
-            rings.append([eye_to_world(u * su + du, v * sv + dv, side) for (u, v) in order])
+            rings.append([eye_to_world(u * su + du, v * sv + dv, side) for (u, v) in rim])
         for i, p in zip(feats["eye", side], rings[0]):
             cage.co[i] = p
         feats["eye_rings", side] = rings[1:]
-    # mouth: an ellipse border and two inset rings that end in a closed lip line
-    slots = [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)]
-    border, m1, m2 = [], [], []
-    for (a, b) in slots:
-        ex, ez = (a * 0.72, b * 0.72) if (a and b) else (float(a), float(b))
-        border.append(project_front(ex * MOUTH_HALF_W * 2.1, MOUTH_C.z + ez * 0.0125, head_sdf))
-        m1.append(project_front(ex * MOUTH_HALF_W * 1.45, MOUTH_C.z + ez * 0.0065, head_sdf))
-        m2.append(project_front(ex * MOUTH_HALF_W, MOUTH_C.z + ez * 0.0004, head_sdf) + V((0, 0.0015, 0)))
-    for i, p in zip(feats["mouth"], border):
-        cage.co[i] = p
-    feats["mouth_rings"] = [m1, m2]
-    cage.co[feats["nose"]] = project_front(0.0, NOSE_Z, head_sdf)
-    # ear sockets
     for side in (-1, 1):
-        loop, keys = feats["ear", side]
-        j0, j1, k0, k1 = EAR_PATCH
-        jc, kc = 0.5 * (j0 + j1), 0.5 * (k0 + k1)
-        for i_v, (j, k) in zip(loop, keys):
-            a, b = (j - jc) / ((j1 - j0) / 2), (k - kc) / ((k1 - k0) / 2)
+        loop, slots = feats["ear", side]
+        for i_v, (a, b) in zip(loop, slots):
             if a and b:
-                a, b = a * 0.78, b * 0.78
-            y, z = EAR_C.y + a * 0.0090, EAR_C.z + b * 0.0130
+                a, b = a * 0.80, b * 0.80
+            y, z = EAR_C.y + a * 0.0090, EAR_C.z + b * 0.0135
             cage.co[i_v] = project_ray(V((0.0, y, z)), V((side, 0, 0)), head_proj_sdf, tmax=0.25)
 
 
@@ -1113,14 +1167,16 @@ def cage_neighbors(cage):
     return nbrs
 
 
-def relax_head(cage, feats, iters=30):
+def relax_head(cage, feats, iters=40):
     """Feature-pinned Laplacian relaxation of the head cage on the head SDF."""
     nbrs = cage_neighbors(cage)
     pinned = {feats["nose"]}
     for side in (-1, 1):
         pinned.update(feats["eye", side])
         pinned.update(feats["ear", side][0])
-    pinned.update(feats["mouth"])
+    for ring in feats["mouth_rings"]:
+        pinned.update(ring)
+    pinned.update(feats["outline"])
     movable = [i for i in cage.groups["head"] if i not in pinned]
     for _ in range(iters):
         new = {}
@@ -1138,14 +1194,10 @@ def add_feature_insets(cage, feats):
             ring = cage.ring(pts, "head", "eye_region")
             cage.bridge(prev, ring)
             prev = ring
-    prev = feats["mouth"]
-    for pts in feats["mouth_rings"]:
-        ring = cage.ring(pts, "head", "mouth_region")
-        cage.bridge(prev, ring)
-        prev = ring
 
 
 def build_ear(cage, side, loop):
+    """A simple anime ear from a 6-vertex socket: base ring, helix rim, bowl, two-quad cap."""
     c = sum((cage.co[i] for i in loop), V()) / len(loop)
     n = V((side, 0.30, 0.04)).normalized()
     u_back = ortho(V((0, 1, 0)), n)
@@ -1162,17 +1214,13 @@ def build_ear(cage, side, loop):
         return cage.ring(pts, "ear")
 
     base = cage.ring([c + (cage.co[i] - c) * 0.95 + n * 0.0040 for i in loop], "ear")
-    rim = ring(0.0115, 0.0040, 0.0120, 0.0015, 0.0205, 0.0040)
-    bowl = ring(0.0108, 0.0032, 0.0072, 0.0016, 0.0135, 0.0026)
+    rim = ring(0.0115, 0.0040, 0.0125, 0.0015, 0.0210, 0.0040)
+    bowl = ring(0.0105, 0.0032, 0.0075, 0.0016, 0.0140, 0.0026)
     cage.bridge(loop, base)
     cage.bridge(base, rim)
     cage.bridge(rim, bowl)
-    cen = cage.v(c + n * 0.0060 + u_back * 0.0030 + u_up * 0.0012, "ear")
-    r = bowl                     # loop starts at a patch corner: corners 0, 2, 4, 6
-    cage.quad(r[0], r[1], cen, r[7])
-    cage.quad(r[1], r[2], r[3], cen)
-    cage.quad(cen, r[3], r[4], r[5])
-    cage.quad(r[7], cen, r[5], r[6])
+    cage.quad(bowl[0], bowl[1], bowl[2], bowl[3])
+    cage.quad(bowl[3], bowl[4], bowl[5], bowl[0])
 
 
 def build_neck(cage, neck_loop, head_hole):
@@ -1206,7 +1254,6 @@ def build_cage():
     arms = {s: build_arm(cage, s, torso["sockets"][s]) for s in (-1, 1)}
     legs = {s: build_leg(cage, s, torso["legs"][s]) for s in (-1, 1)}
     feats = build_head(cage)
-    place_neck_hole(cage, feats)
     place_head_features(cage, feats)
     relax_head(cage, feats)
     add_feature_insets(cage, feats)
@@ -1334,7 +1381,7 @@ def finish_head(ob):
     fixed.add(nose.index)
 
     movable = [v for v in bm.verts if head_w[v.index] > 0.999 and v.index not in fixed]
-    for _ in range(10):
+    for _ in range(25):
         new = []
         for v in movable:
             nb = [e.other_vert(v).co for e in v.link_edges]
@@ -1757,6 +1804,10 @@ def build_hair(body):
         nf = bm.faces.new([vmap[v.index] for v in f.verts])
         nf.material_index = 0
     src.free()
+    bmesh.ops.subdivide_edges(bm, edges=list(bm.edges), cuts=1, use_grid_fill=True)
+    for v in bm.verts:
+        base = project_ray(HEAD_C, v.co - HEAD_C, head_proj_sdf, fallback=v.co.copy())
+        v.co = base + sdf_normal(base, head_proj_sdf) * cap_offset(base)
     # a thickness band around the cap's edge, tucked down to the skin
     edge_loops = []
     bnd = {e for e in bm.edges if e.is_boundary}
@@ -2085,14 +2136,14 @@ def unwrap_body(body, parts):
             c, d, uf, uu = limb_frame(m, [a["S"], a["E"], a["W"]], side)
             r = m - c
             ang = math.degrees(math.atan2(r.dot(uu), r.dot(uf)))
-            seam = abs(dvec.dot(d)) > 0.7 and abs(angle_wrap(math.radians(ang + 90))) < math.radians(9.5)
+            seam = abs(dvec.dot(d)) > 0.7 and abs(angle_wrap(math.radians(ang + 90))) < math.radians(11.5)
         if not seam and l0.startswith("leg"):
             side = 1 if l0.endswith(".L") else -1
             path = [V((side * q.x, q.y, q.z)) for q in (HIP, KNEE, ANKLE)]
             c, d, uf, uu = limb_frame(m, path, side)
             r = m - c
             ang = math.degrees(math.atan2(-side * r.x, -r.y))     # 90 = inner side
-            seam = abs(dvec.dot(d)) > 0.7 and abs(ang - 90) < 9.5
+            seam = abs(dvec.dot(d)) > 0.7 and abs(ang - 90) < 11.5
         if not seam and l0.startswith("hand"):                  # back of the hand | palm
             uu = hands[1 if l0.endswith(".L") else -1]["uu"]
             seam = (f0.normal.dot(uu) > 0) != (f1.normal.dot(uu) > 0)
@@ -2738,6 +2789,9 @@ def symmetrize(ob, tol=0.004):
             continue
         m = V((-v.co.x, v.co.y, v.co.z))
         co, j, d = kd.find(m)
+        if j == v.index and abs(v.co.x) < 0.002:       # a centre-line vertex that drifted
+            v.co.x = 0.0
+            continue
         if d > tol or j == v.index:
             print("symmetry: no partner for", tuple(round(c, 4) for c in v.co), d)
             continue

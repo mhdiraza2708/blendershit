@@ -24,11 +24,11 @@ was **topology that deforms well**:
 
 | mesh | triangles | notes |
 |---|---:|---|
-| Body | 13,732 | skin + outfit painted by material, eyes, lashes, brows, mouth bag |
-| Hair | 7,720 | scalp cap + 33 ribbon locks |
+| Body | 11,188 | skin + outfit painted by material, eyes, lashes, brows, mouth bag |
+| Hair | 7,256 | scalp cap + 33 ribbon locks |
 | Skirt | 1,344 | 24 pleats, double-sided shell with a closed hem |
 | Collar | 1,504 | sailor collar with stripe + ribbon bow |
-| **total** | **24,300** | a mid-range hero character budget |
+| **total** | **21,292** | a mid-range hero character budget |
 
 - **Skeleton:** 97 deform bones (105 with the IK controls).
 - **Skinning:** at most 4 bone influences per vertex, normalised.
@@ -37,36 +37,55 @@ was **topology that deforms well**:
 
 ## Topology
 
-![Face, hair and hand wireframe](renders/topology_head_hair_hand.png)
+![Head topology: with hair, and bald from three sides](renders/topology_head.png)
 
-- **Every face is a quad.**
-  - The meshes are manifold apart from the eye sockets and the hair-cap rim, which are hidden by design.
-  - The body is exactly mirror-symmetric, so X-mirror weight painting and pose mirroring work.
-- **Joints get three loops:**
-  - shoulders, elbows, wrists
-  - hips, knees, ankles
-  - every finger knuckle
-- **Eyes:**
-  - The eye openings are 20-vertex almond rims with five concentric loops each. That's enough for clean blinks.
-  - The lid rim is extruded back into a socket wall, so you never see into the head.
-- **Mouth:** a 16-vertex lip line with four loops around it and a mouth bag behind, so it can open.
-- **Head:** the cage is projected onto a sculpted head (a lofted signed-distance field measured off an anime head reference), then relaxed around the features.
-- **Ears:** extruded from 2×2 sockets.
-- **Groin:** a diamond quad at the front and back of the crotch line keeps every vertex there at five edges or fewer.
-- **Hands:** four-sided finger rings and a separate thumb.
-- **Hair:**
-  - The cap is a copy of the scalp's own quads, lifted off the skin.
-  - Every lock is a closed 6-sided ribbon with clean loops along its length. The locks are draped by a small gravity-and-collision simulation and taper to a point.
+The head is laid out the way anime heads are retopologised by hand:
 
-The method mirrors box modelling. The script builds a low-resolution cage by hand (torso box with
-arm, leg and neck sockets, a 10×6×12 head box with eye, mouth and ear patches), then applies one
-Catmull-Clark subdivision to reach game resolution.
+- **The face is a polar grid around the mouth.** The lip loops grow outward:
+  - into the muzzle
+  - under the nose and around the nose bridge and cheeks
+  - over the brow
+  - out to the hairline and along the jaw
+
+  Lines fan from the chin up through the cheeks.
+- **The vertex count grows outward.** The lip line has 16 vertices (32 after subdivision), and the outer face loops have 24.
+  - Four 1→3 transition cells make up the difference. They put the poles in the nasolabial and jaw area, where real faces carry them.
+  - This avoids a dense "bullseye" around the mouth.
+- **Each eye is set into the face loops.**
+  - It replaces a 3×2-cell block and gets two inset rings.
+  - The almond lid rim has 20 vertices with five loops around it.
+  - The rim is extruded back into a socket wall, so you never see into the head.
+- **A hood covers the cranium.**
+  - Its rows arc from temple to temple over the head; its columns run from the hairline to the base of the skull.
+  - It widens from 6 to 10 columns just behind the hairline and narrows back at the nape. Those poles sit under the hair.
+  - The ears grow out of 1×2 sockets in it.
+- **The jaw flows into the neck.** The bottom of the outermost face loop is the throat, and together with the hood's bottom edge it forms the 8-vertex neck ring.
+
+![Hair and hand wireframe](renders/topology_hair_hand.png)
 
 ![Body wireframe](renders/topology_body.png)
 
+The body is box-modelled as a cage and given one Catmull-Clark subdivision:
+
+- **Density:** 24 around the torso and 16 around the limbs.
+- **Joints:** three loops at the shoulders, elbows, wrists, hips, knees and ankles.
+- **Hands:**
+  - The hand widens from the 16-around wrist into a 20-around palm through one transition cell on the pinky side.
+  - Fingers are 4-sided rings (8 after subdivision) with loops at every knuckle.
+- **Groin:** a diamond quad at the front and back of the crotch line keeps every vertex there at five edges or fewer.
+- **Hair:**
+  - The cap is the scalp's own quads lifted off the skin, with one extra subdivision.
+  - Every lock is a closed 6-sided ribbon with clean loops along its length. The locks are draped by a small gravity-and-collision simulation and taper to a point.
+
+**Health checks:**
+- Every face is a quad.
+- The meshes are manifold, apart from the eye and mouth openings, which are closed off behind by the socket walls and mouth bag.
+- The body is exactly mirror-symmetric, so X-mirror weight painting and pose mirroring work.
+- All normals face outward.
+
 ## Rig
 
-![Deformation test: raised arm, bent elbow and knee, fist, wink, open mouth](renders/deformation_test.png)
+![Deformation test: raised arm, bent elbow and knee (IK), fist, wink, open mouth](renders/deformation_test.png)
 
 - **Deform skeleton (exported):**
   - `Root → Hips → Spine → Chest → UpperChest → Neck → Head`
@@ -143,6 +162,7 @@ The look is set by constants near the top of each section of `build_character.py
   - Treat it as a clean, rig-ready base to refine, not a finished art asset.
 - **No painted textures.** Colour comes from materials, plus a generated iris. The UVs are ready for painting.
 - **Twelve valence-6 poles,** where adjacent fingers meet at the knuckle webs. This is the usual compromise for 4-sided fingers grown from one knuckle row. They sit in the web crease, which barely deforms.
+- **The cranium is lighter than the face** (by design for a hair-covered scalp). Up close, the bald skull silhouette is slightly faceted; the hair cap is subdivided separately, so the visible silhouette is smooth.
 - **The skirt and long hair need physics or spring bones** in the engine to move with the body. Rigidly skinned, they'll clip in extreme poses.
 - **No teeth or tongue.** The mouth bag is a dark cavity, which is enough for anime-style mouths.
 - **The toon look is a render-time setup in `render_previews.py`.** The saved materials are plain base colours so the exporters carry them cleanly; use your engine's toon shader.
